@@ -20,14 +20,18 @@ git clone <repo-url> cici-api && cd cici-api
 powershell -ExecutionPolicy Bypass -File install.ps1   # Windows
 # bash install.sh                                       # macOS/Linux/Git Bash
 
-# 2. Khởi động Cici có CDP + core server
-./start_cici.bat                # mở Cici với --remote-debugging-port=9222
-uvicorn main:app --port 8000    # mở terminal khác, chạy server
+# 2. Mở Cici app + đăng nhập account ByteDance của bạn (thủ công, 1 lần)
+#    (nếu Cici chưa mở khi gọi cici, CLI sẽ TỰ khởi động nó có CDP)
 
-# 3. Dùng (mở terminal MỚI để PATH nhận lệnh cici)
-cici health
+# 3. Dùng — chỉ 1 lệnh!
+cici health                                    # check trạng thái
 cici image "mèo orange dễ thương" -m seedream-4.5
 ```
+
+> 💡 **Auto-launch**: mặc định CLI tự khởi động Cici (có CDP) + core server ngầm nếu chưa chạy.
+> Bạn chỉ cần mở Cici + login thủ công 1 lần (vì login cần account/mật khẩu của bạn).
+> Tắt auto bằng `--no-auto-launch`.
+
 
 
 ---
@@ -262,7 +266,7 @@ cici-api/
 ├── main.py            # CORE: FastAPI endpoints + lifespan (start worker)
 ├── cici_driver.py     # CORE: Playwright CDP driver + worker loop (consumer)
 ├── config.yaml        # CORE: selectors + model registry (sửa khi UI đổi)
-├── start_cici.bat     # Launcher Cici có CDP
+├── start_cici.bat     # Launcher Cici có CDP (thủ công — CLI cũng tự làm)
 ├── test_e2e.py        # Smoke test raw API
 ├── inspect_dom.py     # (dev) re-inspect DOM chat khi UI đổi
 ├── pyproject.toml     # CLI package metadata + entry point `cici`
@@ -273,6 +277,7 @@ cici-api/
 ├── cici/              # CLI package (thin HTTP client → core)
 │   ├── __init__.py
 │   ├── _client.py     # httpx client + URL expiry parser
+│   ├── _launcher.py   # auto-launch Cici + spawn server
 │   └── cli.py         # Click commands: health/image/video/models/status
 └── README.md
 ```

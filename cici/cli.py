@@ -19,6 +19,7 @@ from rich.table import Table
 
 from . import __version__
 from . import _client as api
+from . import _launcher
 
 console = Console(stderr=True)  # human-facing log -> stderr, stdout giữ JSON/URLs sạch cho agent
 out_console = Console()         # stdout (cho URLs / JSON)
@@ -30,8 +31,61 @@ TIMEOUTS = {"image": 320, "video": 620}
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _preflight(base: str) -> bool:
-    """Check core server + Cici reachable. Trả True nếu OK."""
+def _preflight(base: str, auto_launch: bool = True) -> bool:
+    """Đảm bảo core server + Cici sẵn sàng. Trả True nếu OK.
+
+    Với auto_launch=True: nếu thiếu server/Cici → tự khởi động ngầm, rồi retry.
+    Với auto_launch=False: chỉ check, báo hướng dẫn nếu thiếu.
+    """
+    if auto_launch:
+        return _preflight_auto(base)
+    return _preflight_manual(base)
+
+
+def _preflight_auto(base: str) -> bool:
+    """Auto-launch Cici + spawn server nếu thiếu, rồi verify."""
+    # 1. Cici có CDP
+    if not _launcher._cdp_alive():
+        ok, msg = _launcher.ensure_cici(log=console.print)
+        if not ok:
+            out_console.print(Panel.fit(f"[red]{msg}[/]", title="[red]Preflight failed", border_style="red"))
+            return False
+        console.print(f"[green]✓ {msg}[/]")
+    # 2. Login check
+    logged_in, detail = _launcher.check_login()
+    if not logged_in:
+        out_console.print(
+            Panel.fit(
+                f"[bold red]Cici chưa đăng nhập[/]\n{detail}\n\n"
+                "[bold]Cách khắc phục:[/]\n"
+                "  Mở cửa sổ Cici, đăng nhập account ByteDance của bạn,\n"
+                "  rồi chạy lại lệnh này. Tool không thể tự login hộ bạn.",
+                title="[red]Cần đăng nhập Cici",
+                border_style="red",
+            )
+        )
+        return False
+    # 3. Core server
+    if not _launcher._api_alive():
+        ok, msg = _launcher.ensure_server(log=console.print)
+        if not ok:
+            out_console.print(Panel.fit(f"[red]{msg}[/]", title="[red]Preflight failed", border_style="red"))
+            return False
+        console.print(f"[green]✓ {msg}[/]")
+    # 4. Final health verify qua core (worker connect Cici OK?)
+    try:
+        h = api.health(base=base)
+    except api.CiciUnreachable as e:
+        out_console.print(f"[red]✗ Server lên nhưng health lỗi: {e}[/]")
+        return False
+    if h.get("status") != "ok":
+        out_console.print(f"[red]✗ Cici CDP không nối được: {h}[/]")
+        return False
+    return True
+
+
+def _preflight_manual(base: str) -> bool:
+    """Chỉ check, in hướng dẫn nếu thiếu (không auto-launch)."""
     try:
         h = api.health(base=base)
     except api.CiciUnreachable as e:
@@ -40,27 +94,19 @@ def _preflight(base: str) -> bool:
                 f"[bold red]Core server không trả lời[/]\n"
                 f"endpoint: {base}\nlỗi: {e}\n\n"
                 "[bold]Cách khắc phục:[/]\n"
-                "  1. Khởi động Cici có CDP:\n"
-                "       start_cici.bat\n"
-                "     (hoặc: Cici.exe --remote-debugging-port=9222 --user-data-dir=<User Data>)\n"
-                "  2. Khởi động core API server:\n"
-                "       uvicorn main:app --port 8000\n"
-                "  3. Chạy lại lệnh này.",
-                title="[red]Preflight failed",
-                border_style="red",
+                "  1. Khởi động Cici có CDP: start_cici.bat\n"
+                "  2. Khởi động server: uvicorn main:app --port 8000\n"
+                "  3. Chạy lại. (Hoặc bỏ --no-auto-launch để CLI tự khởi động.)",
+                title="[red]Preflight failed", border_style="red",
             )
         )
         return False
     if h.get("status") != "ok":
         out_console.print(
             Panel.fit(
-                f"[bold red]Cici CDP không nối được[/]\n"
-                f"health trả: {h}\n\n"
-                "[bold]Cách khắc phục:[/]\n"
-                "  Cici phải chạy với flag --remote-debugging-port=9222.\n"
-                "  Chạy start_cici.bat (tự kill + relaunch Cici có CDP).",
-                title="[red]Preflight failed",
-                border_style="red",
+                f"[bold red]Cici CDP không nối được[/]\nhealth: {h}\n\n"
+                "Cici phải chạy với --remote-debugging-port=9222. Chạy start_cici.bat.",
+                title="[red]Preflight failed", border_style="red",
             )
         )
         return False
@@ -107,9 +153,9 @@ def _render_result(job: dict, elapsed: float) -> None:
 
 
 def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
-                    model: str | None = None) -> int:
+                    model: str | None = None, auto_launch: bool = True) -> int:
     """Luồng chung cho image/video: preflight -> generate -> wait -> render."""
-    if not _preflight(base):
+    if not _preflight(base, auto_launch=auto_launch):
         return api.EXIT_PREFLIGHT
 
     timeout = TIMEOUTS[kind]
@@ -195,14 +241,18 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
 @click.version_option(__version__, prog_name="cici")
 @click.option("--base", default=api.DEFAULT_BASE, show_default=True,
               help="cici-api core URL (hoặc set env CICI_API).")
+@click.option("--no-auto-launch", is_flag=True, default=False,
+              help="Không tự khởi động Cici/server khi thiếu (chỉ check + hướng dẫn).")
 @click.pass_context
-def main(ctx: click.Context, base: str):
+def main(ctx: click.Context, base: str, no_auto_launch: bool):
     """Gen ảnh/video qua app Cici (Dola Browser).
 
-    Cần core server (cici-api) + Cici đang chạy. Chạy `cici health` để check.
+    Mặc định CLI TỰ khởi động Cici + core server nếu chưa chạy.
+    Dùng --no-auto-launch để tắt (chỉ check, báo hướng dẫn).
     """
     ctx.ensure_object(dict)
     ctx.obj["base"] = base
+    ctx.obj["auto_launch"] = not no_auto_launch
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
@@ -211,26 +261,29 @@ def main(ctx: click.Context, base: str):
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
 @click.pass_context
 def health(ctx: click.Context, as_json: bool):
-    """Check core server + Cici CDP reachable."""
+    """Check core server + Cici CDP reachable (không auto-launch)."""
     base = ctx.obj["base"]
-    try:
-        h = api.health(base=base)
-    except api.CiciUnreachable as e:
-        if as_json:
-            _emit_json({"status": "unreachable", "error": str(e)})
-        else:
-            out_console.print(f"[red]✗ Core server không trả lời: {e}[/]")
-        sys.exit(api.EXIT_PREFLIGHT)
-    if as_json:
-        _emit_json(h)
+    # health thuần check, không auto (để agent biết trạng thái thật)
+    cdp_up = _launcher._cdp_alive()
+    api_up = _launcher._api_alive()
+    if api_up:
+        try:
+            h = api.health(base=base)
+        except api.CiciUnreachable:
+            h = {"status": "error"}
     else:
-        ok = h.get("status") == "ok"
-        icon = "[green]✓[/]" if ok else "[red]✗[/]"
+        h = {"status": "unreachable"}
+    if as_json:
+        _emit_json({**h, "cici_cdp_up": cdp_up, "auto_launch_available": ctx.obj["auto_launch"]})
+    else:
+        cdp_icon = "[green]✓[/]" if cdp_up else "[red]✗[/]"
+        api_icon = "[green]✓[/]" if api_up else "[red]✗[/]"
         out_console.print(
-            f"{icon} core={h.get('status')} · browser={h.get('browser')} · "
-            f"queue={h.get('queue_size')} · {base}"
+            f"{api_icon} core server: {h.get('status')} ({base})\n"
+            f"{cdp_icon} Cici CDP: {'up' if cdp_up else 'down (sẽ auto-launch khi gen)'}\n"
+            f"{'  → sẽ tự khởi động Cici+server nếu thiếu khi chạy image/video' if ctx.obj['auto_launch'] else '  → auto-launch TẮT (--no-auto-launch)'}"
         )
-    sys.exit(api.EXIT_OK if h.get("status") == "ok" else api.EXIT_PREFLIGHT)
+    sys.exit(api.EXIT_OK if (h.get("status") == "ok" and cdp_up) else api.EXIT_PREFLIGHT)
 
 
 @main.command()
@@ -243,7 +296,8 @@ def image(ctx: click.Context, prompt: str, model: str | None, as_json: bool):
 
     Model mặc định: seedream-5-pro. Đổi bằng -m/--model (xem `cici models`).
     """
-    sys.exit(_run_generation(prompt, "image", as_json, ctx.obj["base"], model=model))
+    sys.exit(_run_generation(prompt, "image", as_json, ctx.obj["base"], model=model,
+                             auto_launch=ctx.obj["auto_launch"]))
 
 
 @main.command()
@@ -256,7 +310,8 @@ def video(ctx: click.Context, prompt: str, model: str | None, as_json: bool):
 
     Model mặc định: seedance-2.5. LƯU Ý: core chưa detect <video>, có thể timeout.
     """
-    sys.exit(_run_generation(prompt, "video", as_json, ctx.obj["base"], model=model))
+    sys.exit(_run_generation(prompt, "video", as_json, ctx.obj["base"], model=model,
+                             auto_launch=ctx.obj["auto_launch"]))
 
 
 @main.command()
