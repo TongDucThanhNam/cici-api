@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cici-cli"
+version = "0.1.0"
+description = "CLI để gen ảnh/video qua app Cici (Dola Browser) — thin client cho cici-api core."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "terasumi" }]
+keywords = ["cici", "dola", "doubao", "bytedance", "image-generation", "video-generation", "cli"]
+dependencies = [
+    "httpx>=0.27",
+    "click>=8.1",
+    "rich>=13.7",
+]
+
+[project.scripts]
+# Sau `pip install -e .` lệnh `cici` sẽ available toàn hệ thống.
+cici = "cici.cli:main"
+
+[tool.setuptools]
+packages = ["cici"]

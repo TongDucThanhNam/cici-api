@@ -1,0 +1,89 @@
+# Cici API Wrapper — central selector & timing config.
+# Khi Cici/Dola đổi UI, CHỈ cần sửa file này — không đụng vào code.
+# Tất cả selector được verify trên Cici build Chromium 147.0.7727.89 (Dola Browser).
+
+cdp:
+  # Playwright connect_over_cdp target
+  endpoint: "http://127.0.0.1:9222"
+  # Cici chat tab URL pattern (custom scheme chrome://dola-chat)
+  chat_url_pattern: "dola-chat/chat"
+  # Reconnect backoff (seconds) khi mất kết nối CDP
+  reconnect_initial_delay: 2
+  reconnect_max_delay: 30
+
+selectors:
+  # --- Nút "Cuộc trò chuyện mới" (cần scope main vì có 2 instance) ---
+  new_conversation: '[data-testid="create_conversation_button"]'
+
+  # --- Skill mode buttons (text: Tạo hình ảnh / Tạo video / Viết / Dịch) ---
+  skill_image: 'button[data-testid="skill_bar_button_3"]'   # "Tạo hình ảnh"
+  skill_video: 'button[data-testid="skill_bar_button_17"]'  # "Tạo video"
+
+  # --- Model selector ---
+  # Nút "Model" trong skill mode (text chứa "Model"), click để mở dropdown (Radix menu).
+  # Options: [role="menuitem"], innerText = tên model. Click option matching select_text.
+  model_button: 'button:has-text("Model")'
+  model_option: '[role="menuitem"]'
+
+  # --- Input ---
+  # Chat thường dùng textarea; image/video skill mode dùng contenteditable TiPTap.
+  chat_textarea:  'textarea[data-testid="chat_input_input"]'
+  editor_prose:   'div.tiptap.ProseMirror'
+
+  # --- Send ---
+  send_button: '[data-testid="chat_input_send_button"]'
+
+  # --- Message area ---
+  message_list:  '[data-testid="message-list"]'
+  bot_message:   '[data-testid="receive_message"]'
+  # Cờ "đã gen xong": action bar xuất hiện trong bot message mới nhất
+  done_indicator: '[data-testid="message_action_bar"]'
+  # Ảnh kết quả (src chứa rc_gen_image / ocean-flow / tos-mya)
+  result_image: '[data-testid="mdbox_image"] img'
+
+# --------------------------------------------------------------------------- #
+# Model registry — HARDCODE (Cici không có API list model).
+# `alias` = tên ngắn cho flag --model. `select_text` = text cần click trong dropdown.
+# Khi Cici thêm model mới → cập nhật đây (chạy `python inspect_models.py` để re-check).
+# --------------------------------------------------------------------------- #
+models:
+  image:
+    default: seedream-5-pro
+    options:
+      - alias: seedream-5-pro
+        name: "Seedream 5.0 Pro"
+        select_text: "Seedream 5.0 Pro"
+        note: "Mặc định. Chất lượng cao nhất, mục đích chuyên nghiệp."
+      - alias: seedream-4.5
+        name: "Seedream 4.5"
+        select_text: "Seedream 4.5"
+        note: "Chất lượng ổn định, hàng ngày."
+  video:
+    default: seedance-2.5
+    options:
+      - alias: seedance-2.5
+        name: "Dreamina Seedance 2.5"
+        select_text: "Dreamina Seedance 2.5"
+        note: "Mặc định. Chất lượng video tốt nhất."
+      - alias: seedance-2-fast
+        name: "Dreamina Seedance 2.0 Nhanh"
+        select_text: "Dreamina Seedance 2.0 Nhanh"
+        note: "Nhanh, chất lượng tốt."
+      - alias: seedance-1.0
+        name: "Dreamina Seedance 1.0"
+        select_text: "Dreamina Seedance 1.0"
+        note: "Video đơn giản."
+
+timing:
+  # Polling interval (s) khi chờ kết quả
+  poll_interval: 3
+  # Timeout tối đa mỗi job (s). Image ~123s thực tế; video lâu hơn.
+  image_timeout: 300
+  video_timeout: 600
+  # Nhỏ giây giữa các thao tác UI (s)
+  ui_step_delay: 1.0
+
+concurrency:
+  # Worker đơn luồng — Cici chỉ có 1 ô chat, bắt buộc xử lý tuần tự.
+  # Tăng con số này sẽ gây đua UI -> crash.
+  worker_count: 1

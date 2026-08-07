@@ -1,0 +1,7 @@
+# Chuẩn hóa line endings: LF trong repo, để OS tự convert checkout.
+* text=auto eol=lf
+*.ps1 text eol=crlf    # PowerShell ổn định hơn với CRLF
+*.bat text eol=crlf    # batch files cần CRLF trên Windows
+*.png binary
+*.jpg binary
+*.mp4 binary

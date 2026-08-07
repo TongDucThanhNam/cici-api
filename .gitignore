@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime / logs
+*.log
+server.log
+*.pid
+
+# Playwright / Cici screenshots (dev artifacts)
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local secrets / overrides (không đẩy config cá nhân)
+config.local.yaml
+.env
+.env.local
