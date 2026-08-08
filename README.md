@@ -184,6 +184,21 @@ cici status <job_id>
 
 Registry nằm trong `config.yaml` (`models:` section). Khi Cici thêm model → chạy `python inspect_dom.py` re-check + cập nhật config.
 
+### Quota tracking
+
+Cici free có giới hạn gen hằng ngày nhưng **không tiết lộ** số còn lại / khi reset. Tool **tự track local**:
+
+- **`cici quota`** — xem số đã dùng (rolling 24h), threshold đã học, còn lại, khi reset
+- **Auto-learn threshold** — khi bạn hit limit lần đầu, tool ghi nhớ "N gen thì hết" → từ đó cảnh báo + **từ chối gen trước khi tốn thời gian chờ fail** (exit 4)
+- **Rolling 24h** — quota window trượt, phản ánh đúng cách ByteDance limit (gen cũ tự drop khỏi count sau 24h)
+
+```bash
+cici quota                  # xem cả image + video
+cici quota --json           # JSON cho agent
+```
+
+State lưu ở `~/.cici/quota.json`. Xoá file đó để reset.
+
 ### Exit codes (để AI agent rẽ nhánh)
 
 | Code | Ý nghĩa | Khi nào |
@@ -192,6 +207,7 @@ Registry nằm trong `config.yaml` (`models:` section). Khi Cici thêm model →
 | `1` | FAILED | job COMPLETED với lỗi server-side |
 | `2` | TIMEOUT | gen không xong trong timeout (320s ảnh / 620s video) |
 | `3` | PREFLIGHT | core server hoặc Cici chưa chạy → CLI in hướng dẫn khắc phục |
+| `4` | QUOTA_EXHAUSTED | hết quota hằng ngày — **đừng retry ngay**, chờ reset (rolling 24h) |
 
 ### Agent integration note
 
@@ -278,7 +294,8 @@ cici-api/
 │   ├── __init__.py
 │   ├── _client.py     # httpx client + URL expiry parser
 │   ├── _launcher.py   # auto-launch Cici + spawn server
-│   └── cli.py         # Click commands: health/image/video/models/status
+│   ├── _quota.py      # rolling 24h quota tracker + auto-learn threshold
+│   └── cli.py         # Click commands: health/image/video/models/quota/status
 └── README.md
 ```
 

@@ -25,6 +25,20 @@ from playwright.async_api import (
     async_playwright,
 )
 
+# local import (cici package is sibling of cici_driver.py)
+try:
+    from cici import _quota
+except ImportError:  # core có thể chạy standalone (không cài package)
+    _quota = None  # type: ignore[assignment]
+
+
+class QuotaExhausted(Exception):
+    """Cici báo hết quota hằng ngày (message detect trong bot response)."""
+    def __init__(self, message: str, kind: str):
+        super().__init__(message)
+        self.kind = kind
+        self.raw_message = message
+
 log = logging.getLogger("cici.driver")
 
 
@@ -181,11 +195,12 @@ class CiciDriver:
         page = await self._ensure_page()
         await page.get_by_role("main").locator(self.sel["send_button"]).click()
 
-    async def _wait_result(self, timeout: float) -> list[str]:
+    async def _wait_result(self, timeout: float, kind: str = "image") -> list[str]:
         """Poll message-list; return list of generated media URLs when done.
 
         'Done' = the newest bot message contains an action bar (data-testid
         message_action_bar) AND at least one result image.
+        Raises QuotaExhausted nếu bot message chứa text báo hết quota hằng ngày.
         """
         page = await self._ensure_page()
         deadline = time.time() + timeout
@@ -195,18 +210,21 @@ class CiciDriver:
             res = await page.evaluate(
                 r"""(sel) => {
                     const ml = document.querySelector(sel.message_list);
-                    if (!ml) return {recv: 0, done: false, urls: []};
+                    if (!ml) return {recv: 0, done: false, urls: [], text: ''};
                     const recvs = ml.querySelectorAll(sel.bot_message);
                     const last = recvs[recvs.length - 1];
-                    if (!last) return {recv: recvs.length, done: false, urls: []};
+                    if (!last) return {recv: recvs.length, done: false, urls: [], text: ''};
                     const done = !!last.querySelector(sel.done_indicator);
                     const imgs = Array.from(last.querySelectorAll(sel.result_image))
                         .map(i => i.currentSrc || i.src || '')
                         .filter(s => s && !s.startsWith('data:'));
-                    return {recv: recvs.length, done, urls: imgs};
+                    return {recv: recvs.length, done, urls: imgs, text: (last.innerText||'').slice(0,400)};
                 }""",
                 self.sel,
             )
+            # detect quota-exhausted message BEFORE treating as success/timeout
+            if _quota and res.get("text") and _quota.is_exhausted_message(res["text"]):
+                raise QuotaExhausted(res["text"], kind)
             if res["urls"] and (res["done"] or len(res["urls"]) >= 1):
                 # require "done" if present, else settle for >=1 image
                 if res["done"]:
@@ -228,12 +246,31 @@ class CiciDriver:
                 await self._select_model(job.kind, job.model)
                 await self._type_prompt(job.prompt)
                 await self._send()
-                urls = await self._wait_result(timeout)
+                urls = await self._wait_result(timeout, kind=job.kind)
+                # success → record quota
+                if _quota:
+                    state = _quota.load()
+                    _quota.record_success(state, job.kind)
+                    _quota.save(state)
                 return {
                     "status": "COMPLETED",
                     "result_urls": urls,
                     "kind": job.kind,
                     "model": job.model or self.cfg["models"][job.kind]["default"],
+                }
+            except QuotaExhausted as e:
+                # quota hết → record limit-hit (auto-learn threshold)
+                if _quota:
+                    state = _quota.load()
+                    thr = _quota.record_limit_hit(state, job.kind)
+                    _quota.save(state)
+                    log.warning("Job %s QUOTA EXHAUSTED (kind=%s, learned threshold=%s)",
+                                job.job_id, job.kind, thr)
+                return {
+                    "status": "QUOTA_EXHAUSTED",
+                    "kind": job.kind,
+                    "message": e.raw_message,
+                    "quota": _quota.snapshot(_quota.load(), job.kind) if _quota else None,
                 }
             except Exception as e:  # noqa: BLE001
                 log.error("Job %s failed: %s", job.job_id, e)

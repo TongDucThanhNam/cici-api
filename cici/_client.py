@@ -18,6 +18,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1      # job COMPLETED với FAILED, hoặc lỗi logic
 EXIT_TIMEOUT = 2     # gen không xong trong timeout
 EXIT_PREFLIGHT = 3   # core server / Cici chưa chạy
+EXIT_QUOTA = 4       # quota hằng ngày đã cạn (khác hẳn lỗi tạm thời — đừng retry ngay)
 
 
 class CiciUnreachable(Exception):
@@ -60,7 +61,10 @@ def models(base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
 
 def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 10.0,
              model: str | None = None) -> str:
-    """POST /api/generate -> trả job_id ngay (server enqueue, không block)."""
+    """POST /api/generate -> trả job_id ngay (server enqueue, không block).
+
+    Raise QuotaExhausted (code 429) nếu local estimate báo quota đã cạn.
+    """
     payload = {"prompt": prompt, "type": kind}
     if model:
         payload["model"] = model
@@ -68,8 +72,31 @@ def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 
         r = c.post(f"{base}/api/generate", json=payload)
     if r.status_code == 422:
         raise ValueError(r.json().get("detail", "invalid model"))
+    if r.status_code == 429:
+        # server refuse vì quota local estimate = 0
+        try:
+            detail = r.json().get("detail", {})
+        except Exception:
+            detail = {"message": r.text}
+        raise QuotaExhausted(detail)
     r.raise_for_status()
     return r.json()["job_id"]
+
+
+class QuotaExhausted(Exception):
+    """Server refuse enqueue vì local quota estimate = 0."""
+    def __init__(self, detail: dict):
+        self.detail = detail
+        super().__init__(detail.get("message", "quota exhausted"))
+
+
+def quota(kind: str | None = None, base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
+    """GET /api/quota — snapshot rolling 24h count + threshold."""
+    params = {"kind": kind} if kind else {}
+    with httpx.Client(timeout=timeout) as c:
+        r = c.get(f"{base}/api/quota", params=params)
+    r.raise_for_status()
+    return r.json()
 
 
 def wait_status(

@@ -5,6 +5,7 @@ Thin client gọi cici-api core server. Cần core server + Cici chạy trước
 Exit codes (cho AI agent phân biệt):
     0 = COMPLETED        1 = FAILED (job)
     2 = TIMEOUT          3 = PREFLIGHT (server/Cici chưa chạy)
+    4 = QUOTA_EXHAUSTED (hết quota hằng ngày — đừng retry ngay, chờ reset)
 """
 from __future__ import annotations
 
@@ -163,6 +164,21 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
 
     try:
         job_id = api.generate(prompt, kind, base=base, model=model)
+    except api.QuotaExhausted as e:
+        # server refuse vì local quota estimate = 0 (đừng lãng phí thời gian gen)
+        if as_json:
+            _emit_json({"status": "QUOTA_EXHAUSTED", "kind": kind, "detail": e.detail})
+        else:
+            out_console.print(
+                Panel.fit(
+                    f"[bold red]Quota {kind} đã cạn (local estimate)[/]\n"
+                    f"{e.detail.get('message', '')}\n\n"
+                    "[dim]Chạy `cici quota` xem chi tiết. Đừng retry ngay — "
+                    "chờ reset (rolling 24h).[/]",
+                    title="[red]Quota exhausted", border_style="red",
+                )
+            )
+        return api.EXIT_QUOTA
     except ValueError as e:  # invalid model alias
         out_console.print(f"[red]✗ {e}[/]\n[dim]Chạy `cici models` để xem alias hợp lệ.[/]")
         return api.EXIT_FAILED
@@ -200,6 +216,27 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
 
     elapsed = time.time() - t0
     status = job.get("status")
+
+    if status == "QUOTA_EXHAUSTED":
+        # Cici thực sự báo hết quota trong lúc gen
+        if as_json:
+            _emit_json({
+                "status": "QUOTA_EXHAUSTED",
+                "job_id": job_id,
+                "kind": kind,
+                "message": job.get("message"),
+                "quota": job.get("quota"),
+            })
+        else:
+            out_console.print(
+                Panel.fit(
+                    f"[bold red]Cici báo hết quota {kind}[/]\n"
+                    f"[dim]{job.get('message', '')}[/]\n\n"
+                    "Đừng retry ngay — chờ reset (rolling 24h).",
+                    title="[red]Quota exhausted", border_style="red",
+                )
+            )
+        return api.EXIT_QUOTA
 
     if status == "COMPLETED":
         if as_json:
@@ -312,6 +349,54 @@ def video(ctx: click.Context, prompt: str, model: str | None, as_json: bool):
     """
     sys.exit(_run_generation(prompt, "video", as_json, ctx.obj["base"], model=model,
                              auto_launch=ctx.obj["auto_launch"]))
+
+
+@main.command()
+@click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
+@click.pass_context
+def quota(ctx: click.Context, as_json: bool):
+    """Xem quota còn lại (rolling 24h local estimate + threshold đã học)."""
+    base = ctx.obj["base"]
+    try:
+        snap = api.quota(base=base)
+    except api.CiciUnreachable as e:
+        if as_json:
+            _emit_json({"status": "unreachable", "error": str(e)})
+        else:
+            out_console.print(f"[red]✗ Core server không trả lời: {e}[/]")
+        sys.exit(api.EXIT_PREFLIGHT)
+    except Exception as e:  # 501 nếu quota tracking unavailable
+        if as_json:
+            _emit_json({"status": "unavailable", "error": str(e)})
+        else:
+            out_console.print(f"[yellow]⚠ Quota tracking chưa sẵn sàng: {e}[/]")
+        sys.exit(api.EXIT_FAILED)
+
+    if as_json:
+        _emit_json(snap)
+        sys.exit(api.EXIT_OK)
+
+    # human render
+    for kind, info in snap.items():
+        used = info.get("used_in_window", 0)
+        thr = info.get("threshold")
+        rmn = info.get("remaining")
+        window = info.get("window_hours", 24)
+        reset = info.get("reset_in_seconds")
+        tbl = Table(title=f"Quota · {kind} (rolling {window}h)", show_lines=False)
+        tbl.add_column("metric", style="cyan")
+        tbl.add_column("value")
+        tbl.add_row("used", str(used))
+        tbl.add_row("threshold (auto-learn)", str(thr) if thr is not None else "[dim]chưa học (chưa từng hit limit)[/]")
+        if rmn is not None:
+            color = "green" if rmn > 0 else "red"
+            tbl.add_row("remaining", f"[{color}]{rmn}[/{color}]")
+        if reset is not None:
+            hrs = reset / 3600
+            tbl.add_row("reset trong", f"{hrs:.1f}h (khi gen cũ nhất roll ra khỏi window)")
+        out_console.print(tbl)
+        out_console.print()
+    sys.exit(api.EXIT_OK)
 
 
 @main.command()

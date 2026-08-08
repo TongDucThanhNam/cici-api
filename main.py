@@ -22,6 +22,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from cici_driver import CiciDriver, Job, JobStore, load_config
+try:
+    from cici import _quota
+except ImportError:
+    _quota = None  # type: ignore[assignment]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,6 +86,60 @@ async def list_models():
     return cfg.get("models", {})
 
 
+@app.get("/api/quota")
+async def get_quota(kind: str | None = None):
+    """Quota summary (rolling 24h local count + auto-learned threshold).
+
+    ?kind=image hoặc ?kind=video để lọc.
+    """
+    if not _quota:
+        raise HTTPException(status_code=501, detail="quota tracking unavailable (cici package missing)")
+    state = _quota.load()
+    return _quota.snapshot(state, kind)
+
+
+@app.post("/api/generate", response_model=GenerateResponse, status_code=202)
+async def generate(req: GenerateRequest):
+    # validate model alias if provided
+    if req.model:
+        registry = cfg.get("models", {}).get(req.type, {})
+        valid = [o["alias"] for o in registry.get("options", [])]
+        if req.model not in valid:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown model '{req.model}' for type '{req.type}'. Valid: {valid}",
+            )
+    # refuse nếu quota đã cạn (đừng lãng phí thời gian chờ fail)
+    if _quota:
+        state = _quota.load()
+        rmn = _quota.remaining(state, req.type)
+        if rmn is not None and rmn == 0:
+            snap = _quota.snapshot(state, req.type)
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": f"Quota {req.type} đã cạn (local estimate). Thử lại sau khi reset.",
+                    "quota": snap[req.type] if req.type in snap else snap,
+                },
+            )
+    job = Job(job_id=str(uuid.uuid4()), kind=req.type, prompt=req.prompt, model=req.model)
+    STORE.set(
+        job.job_id,
+        status="PENDING",
+        kind=job.kind,
+        model=job.model or cfg["models"][req.type]["default"],
+        prompt=job.prompt,
+        created_at=job.created_at,
+    )
+    await JOB_QUEUE.put(job)
+    log.info("Enqueued job %s (%s/%s): %s", job.job_id, job.kind, job.model, job.prompt[:60])
+    return GenerateResponse(
+        job_id=job.job_id,
+        status="PENDING",
+        message=f"Job queued. Poll GET /api/status/{job.job_id} for results.",
+    )
+
+
 @app.get("/api/health")
 async def health():
     """Probe whether Cici CDP is reachable."""
@@ -101,35 +159,6 @@ async def health():
         }
     except Exception as e:  # noqa: BLE001
         return {"status": "unreachable", "cdp_endpoint": cdp, "error": str(e)}
-
-
-@app.post("/api/generate", response_model=GenerateResponse, status_code=202)
-async def generate(req: GenerateRequest):
-    # validate model alias if provided
-    if req.model:
-        registry = cfg.get("models", {}).get(req.type, {})
-        valid = [o["alias"] for o in registry.get("options", [])]
-        if req.model not in valid:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Unknown model '{req.model}' for type '{req.type}'. Valid: {valid}",
-            )
-    job = Job(job_id=str(uuid.uuid4()), kind=req.type, prompt=req.prompt, model=req.model)
-    STORE.set(
-        job.job_id,
-        status="PENDING",
-        kind=job.kind,
-        model=job.model or cfg["models"][req.type]["default"],
-        prompt=job.prompt,
-        created_at=job.created_at,
-    )
-    await JOB_QUEUE.put(job)
-    log.info("Enqueued job %s (%s/%s): %s", job.job_id, job.kind, job.model, job.prompt[:60])
-    return GenerateResponse(
-        job_id=job.job_id,
-        status="PENDING",
-        message=f"Job queued. Poll GET /api/status/{job.job_id} for results.",
-    )
 
 
 @app.get("/api/status/{job_id}")
