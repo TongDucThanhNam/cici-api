@@ -191,46 +191,72 @@ class CiciDriver:
             await ta.wait_for(state="visible", timeout=10000)
             await ta.fill(prompt)
 
-    async def _send(self) -> None:
+    async def _send(self) -> int:
+        """Click send. Trả về số bot messages có TRƯỚC khi gửi,
+        để _wait_result biết phải chờ tới khi nào (race-safe)."""
         page = await self._ensure_page()
+        # đếm bot messages hiện có trước khi send
+        before = await page.evaluate(
+            r"""(sel) => {
+                const ml = document.querySelector(sel.message_list);
+                return ml ? ml.querySelectorAll(sel.bot_message).length : 0;
+            }""",
+            self.sel,
+        )
         await page.get_by_role("main").locator(self.sel["send_button"]).click()
+        return before
 
-    async def _wait_result(self, timeout: float, kind: str = "image") -> list[str]:
+    async def _wait_result(self, timeout: float, kind: str = "image",
+                           bot_count_before: int = 0) -> list[str]:
         """Poll message-list; return list of generated media URLs when done.
 
-        'Done' = the newest bot message contains an action bar (data-testid
-        message_action_bar) AND at least one result image.
+        Race-safe: chỉ nhìn bot message thứ `bot_count_before + 1` trở đi
+        (message mới do prompt vừa gửi tạo ra), KHÔNG phải "message mới nhất".
+        Tránh pick nhầm result của job trước khi chưa kịp clear, hoặc job khác.
+
+        'Done' = bot message mới chứa action bar (data-testid message_action_bar)
+        AND ít nhất 1 result image.
         Raises QuotaExhausted nếu bot message chứa text báo hết quota hằng ngày.
         """
         page = await self._ensure_page()
         deadline = time.time() + timeout
         interval = self.tm["poll_interval"]
-        last_count = -1
+        last_url_count = -1
         while time.time() < deadline:
             res = await page.evaluate(
-                r"""(sel) => {
+                r"""({sel, before}) => {
                     const ml = document.querySelector(sel.message_list);
-                    if (!ml) return {recv: 0, done: false, urls: [], text: ''};
-                    const recvs = ml.querySelectorAll(sel.bot_message);
-                    const last = recvs[recvs.length - 1];
-                    if (!last) return {recv: recvs.length, done: false, urls: [], text: ''};
+                    if (!ml) return {recv: 0, newRecv: 0, done: false, urls: [], text: ''};
+                    const recvs = Array.from(ml.querySelectorAll(sel.bot_message));
+                    // chỉ xét bot messages MỚI hơn thời điểm send (index >= before)
+                    const newOnes = recvs.slice(before);
+                    if (newOnes.length === 0)
+                        return {recv: recvs.length, newRecv: 0, done: false, urls: [], text: ''};
+                    // lấy message mới nhất trong nhóm mới (job này sinh ra)
+                    const last = newOnes[newOnes.length - 1];
                     const done = !!last.querySelector(sel.done_indicator);
                     const imgs = Array.from(last.querySelectorAll(sel.result_image))
                         .map(i => i.currentSrc || i.src || '')
                         .filter(s => s && !s.startsWith('data:'));
-                    return {recv: recvs.length, done, urls: imgs, text: (last.innerText||'').slice(0,400)};
+                    return {
+                        recv: recvs.length,
+                        newRecv: newOnes.length,
+                        done, urls: imgs,
+                        text: (last.innerText||'').slice(0,400)
+                    };
                 }""",
-                self.sel,
+                {"sel": self.sel, "before": bot_count_before},
             )
             # detect quota-exhausted message BEFORE treating as success/timeout
             if _quota and res.get("text") and _quota.is_exhausted_message(res["text"]):
                 raise QuotaExhausted(res["text"], kind)
-            if res["urls"] and (res["done"] or len(res["urls"]) >= 1):
-                # require "done" if present, else settle for >=1 image
+            # phải có ít nhất 1 bot message mới (job này đã được Cici nhận)
+            if res.get("newRecv", 0) > 0 and res["urls"]:
                 if res["done"]:
                     return res["urls"]
-                if len(res["urls"]) > last_count and len(res["urls"]) >= 1:
-                    last_count = len(res["urls"])
+                # nếu chưa done nhưng số url tăng (Cici đang sinh thêm ảnh)
+                if len(res["urls"]) > last_url_count:
+                    last_url_count = len(res["urls"])
             await asyncio.sleep(interval)
         raise TimeoutError(f"No result within {timeout}s")
 
@@ -241,12 +267,17 @@ class CiciDriver:
                 self.tm["image_timeout"] if job.kind == "image" else self.tm["video_timeout"]
             )
             try:
+                # MỖI job = conversation mới → tách biệt hoàn toàn message history.
+                # _new_conversation đã làm việc này; ta chỉ cần capture snapshot
+                # số bot messages TRƯỚC khi send để _wait_result chỉ nhìn message mới.
                 await self._new_conversation()
                 await self._select_skill(job.kind)
                 await self._select_model(job.kind, job.model)
                 await self._type_prompt(job.prompt)
-                await self._send()
-                urls = await self._wait_result(timeout, kind=job.kind)
+                bot_count_before = await self._send()
+                urls = await self._wait_result(
+                    timeout, kind=job.kind, bot_count_before=bot_count_before
+                )
                 # success → record quota
                 if _quota:
                     state = _quota.load()
