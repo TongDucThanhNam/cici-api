@@ -25,6 +25,12 @@ selectors:
   model_button: 'button:has-text("Model")'
   model_option: '[role="menuitem"]'
 
+  # --- Reference image upload (image mode only) ---
+  # Nút "Reference Image" — click mở native file chooser (multiple).
+  # Upload qua Playwright filechooser event + set_files.
+  ref_button: '[data-testid="image-creation-chat-input-picture-reference-button"]'
+  ref_max: 10  # server-side limit (ByteDance)
+
   # --- Input ---
   # Chat thường dùng textarea; image/video skill mode dùng contenteditable TiPTap.
   chat_textarea:  'textarea[data-testid="chat_input_input"]'

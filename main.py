@@ -69,6 +69,7 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=2000)
     type: Literal["image", "video"] = "image"
     model: str | None = None   # alias from config.yaml models.<type>.options[].alias
+    references: list[str] = Field(default_factory=list)  # local file paths for reference-image gen
 
 
 class GenerateResponse(BaseModel):
@@ -122,7 +123,23 @@ async def generate(req: GenerateRequest):
                     "quota": snap[req.type] if req.type in snap else snap,
                 },
             )
-    job = Job(job_id=str(uuid.uuid4()), kind=req.type, prompt=req.prompt, model=req.model)
+    # validate references
+    refs = req.references or []
+    if refs:
+        if req.type != "image":
+            raise HTTPException(status_code=422, detail="references chỉ hỗ trợ cho type=image")
+        ref_max = cfg.get("selectors", {}).get("ref_max", 10)
+        if len(refs) > ref_max:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Tối đa {ref_max} reference images, nhận được {len(refs)}",
+            )
+        from pathlib import Path
+        missing = [p for p in refs if not Path(p).exists()]
+        if missing:
+            raise HTTPException(status_code=422, detail=f"Reference files not found: {missing}")
+    job = Job(job_id=str(uuid.uuid4()), kind=req.type, prompt=req.prompt,
+              model=req.model, references=refs)
     STORE.set(
         job.job_id,
         status="PENDING",
@@ -132,7 +149,8 @@ async def generate(req: GenerateRequest):
         created_at=job.created_at,
     )
     await JOB_QUEUE.put(job)
-    log.info("Enqueued job %s (%s/%s): %s", job.job_id, job.kind, job.model, job.prompt[:60])
+    log.info("Enqueued job %s (%s/%s, %d refs): %s", job.job_id, job.kind, job.model,
+             len(job.references), job.prompt[:60])
     return GenerateResponse(
         job_id=job.job_id,
         status="PENDING",

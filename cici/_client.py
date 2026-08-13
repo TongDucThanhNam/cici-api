@@ -60,7 +60,7 @@ def models(base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
 
 
 def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 10.0,
-             model: str | None = None) -> str:
+             model: str | None = None, references: list[str] | None = None) -> str:
     """POST /api/generate -> trả job_id ngay (server enqueue, không block).
 
     Raise QuotaExhausted (code 429) nếu local estimate báo quota đã cạn.
@@ -68,12 +68,18 @@ def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 
     payload = {"prompt": prompt, "type": kind}
     if model:
         payload["model"] = model
+    if references:
+        payload["references"] = references
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{base}/api/generate", json=payload)
     if r.status_code == 422:
-        raise ValueError(r.json().get("detail", "invalid model"))
+        try:
+            detail = r.json().get("detail", "invalid request")
+        except Exception:
+            detail = "invalid request"
+        raise ValueError(detail)
     if r.status_code == 429:
-        # server refuse vì quota local estimate = 0
+        # server refuse vì local quota estimate = 0
         try:
             detail = r.json().get("detail", {})
         except Exception:

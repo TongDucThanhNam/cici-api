@@ -14,6 +14,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import yaml
@@ -59,6 +60,7 @@ class Job:
     kind: str            # "image" | "video"
     prompt: str
     model: str | None = None   # alias trong config.yaml models.<kind>.options[].alias
+    references: list[str] = field(default_factory=list)  # local file paths for reference-image gen
     created_at: float = field(default_factory=time.time)
 
 
@@ -175,6 +177,47 @@ class CiciDriver:
         await option.click()
         await asyncio.sleep(self.tm["ui_step_delay"])
 
+    async def _upload_references(self, paths: list[str]) -> None:
+        """Upload reference images.
+
+        UI thay đổi theo version Cici — thử nhiều cách theo thứ tự:
+          1. UI mới (>=147.0.7727.149): mở modal Templates → set_input_files vào
+             input ẩn (đã verify inputFilesCount=1) → đóng modal (Escape).
+          2. UI cũ: click nút "Reference Image" → filechooser event → set_files.
+        """
+        if not paths:
+            return
+        # validate paths exist trước (fail fast, đừng để Cici lỗi mù)
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            raise FileNotFoundError(f"Reference files not found: {missing}")
+        page = await self._ensure_page()
+        main = page.get_by_role("main")
+
+        # --- approach 1: new UI — Templates modal + hidden upload input ---
+        try:
+            tpl = main.locator('button', has_text="Templates").first
+            await tpl.click(timeout=5000)
+            await asyncio.sleep(1.5)
+            fi = page.locator('input[type="file"]').first
+            await fi.set_input_files(paths, timeout=5000)
+            await asyncio.sleep(2.0)
+            # đóng modal để quay lại input chính
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(1.0)
+            log.info("Uploaded %d reference(s) via Templates modal", len(paths))
+            return
+        except Exception as e:  # noqa: BLE001
+            log.info("New-UI upload failed (%s); falling back to old ref button", e)
+
+        # --- approach 2: old UI — Reference Image button + filechooser ---
+        async with page.expect_file_chooser(timeout=5000) as fc_info:
+            await main.locator(self.sel["ref_button"]).click()
+        chooser = await fc_info.value
+        await chooser.set_files(paths)
+        await asyncio.sleep(max(self.tm["ui_step_delay"], 1.5))
+        log.info("Uploaded %d reference(s) via filechooser", len(paths))
+
     async def _type_prompt(self, prompt: str) -> None:
         """In skill mode the input is a contenteditable TiPTap; fallback to textarea."""
         page = await self._ensure_page()
@@ -273,6 +316,8 @@ class CiciDriver:
                 await self._new_conversation()
                 await self._select_skill(job.kind)
                 await self._select_model(job.kind, job.model)
+                if job.references:
+                    await self._upload_references(job.references)
                 await self._type_prompt(job.prompt)
                 bot_count_before = await self._send()
                 urls = await self._wait_result(

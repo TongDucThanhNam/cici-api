@@ -154,7 +154,8 @@ def _render_result(job: dict, elapsed: float) -> None:
 
 
 def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
-                    model: str | None = None, auto_launch: bool = True) -> int:
+                    model: str | None = None, auto_launch: bool = True,
+                    references: list[str] | None = None) -> int:
     """Luồng chung cho image/video: preflight -> generate -> wait -> render."""
     if not _preflight(base, auto_launch=auto_launch):
         return api.EXIT_PREFLIGHT
@@ -163,7 +164,7 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
     t0 = time.time()
 
     try:
-        job_id = api.generate(prompt, kind, base=base, model=model)
+        job_id = api.generate(prompt, kind, base=base, model=model, references=references)
     except api.QuotaExhausted as e:
         # server refuse vì local quota estimate = 0 (đừng lãng phí thời gian gen)
         if as_json:
@@ -326,15 +327,27 @@ def health(ctx: click.Context, as_json: bool):
 @main.command()
 @click.argument("prompt")
 @click.option("-m", "--model", default=None, help="Model alias (xem `cici models`).")
+@click.option("--ref", "refs", multiple=True,
+              help="Ảnh tham chiếu (đường dẫn local). Lặp lại được, hoặc dùng dấu phẩy: --ref a.png,b.png. Tối đa 10.")
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
 @click.pass_context
-def image(ctx: click.Context, prompt: str, model: str | None, as_json: bool):
+def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, ...],
+          as_json: bool):
     """Sinh ảnh từ PROMPT (block tới xong, ~2-3 phút).
 
     Model mặc định: seedream-5-pro. Đổi bằng -m/--model (xem `cici models`).
+    Thêm ảnh tham chiếu bằng --ref (nhiều lần hoặc phân tách bằng dấu phẩy).
     """
+    # flatten: mỗi --ref có thể chứa nhiều path comma-separated
+    ref_list: list[str] = []
+    for r in refs:
+        for part in r.split(","):
+            part = part.strip()
+            if part:
+                ref_list.append(part)
     sys.exit(_run_generation(prompt, "image", as_json, ctx.obj["base"], model=model,
-                             auto_launch=ctx.obj["auto_launch"]))
+                             auto_launch=ctx.obj["auto_launch"],
+                             references=ref_list or None))
 
 
 @main.command()
