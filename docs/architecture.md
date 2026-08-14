@@ -67,7 +67,9 @@ timing out on jobs that are simply waiting their turn.
 - A successful result requires the completion action bar (chat branch) and at
   least one non-data media URL. Video blocks are clicked to lazy-instantiate the
   `<video>` element before extracting its src. Quota exhaustion is checked before
-  success.
+  success. Image URLs are then upgraded from chat previews to full-size
+  originals via the image viewer (see `docs/ui-automation.md`), falling back to
+  preview URLs when the viewer is unavailable.
 - On an execution error, reload the page when possible so the next queued job
   does not inherit a poisoned UI state. The worker loop itself must survive errors.
 - Jobs have two deadlines: the per-kind generation timeout inside

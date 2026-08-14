@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cici_driver import _POLL_RESULT_JS, _SNAPSHOT_JS, CiciDriver, load_config  # noqa: E402
+from cici_driver import _FULLSIZE_JS, _POLL_RESULT_JS, _SNAPSHOT_JS, CiciDriver, load_config  # noqa: E402
 from cici import _quota  # noqa: E402
 
 SEL = {
@@ -237,12 +237,37 @@ def main() -> int:
         assert driver._is_refusal_message("Video đã tạo xong cho bạn.") is False
         passed += 1
         print("PASS 10: copyright/content refusal detected (no timeout spin)")
+
+        # 11. full-size upgrade JS: map base path -> URL gốc image_pre_watermark
+        # (preview downsize_watermark ~288px; bản gốc do viewer lazy-load)
+        BASE_A = IMG1.split("~tplv")[0] if "~tplv" in IMG1 else "https://cdn.example.com/rc_gen_image/a1.jpeg"
+        BASE_B = "https://cdn.example.com/rc_gen_image/b1.jpeg"
+        PREVIEW_A = BASE_A + "~tplv-xxx-downsize_watermark_1_5.png?sig=1"
+        FULL_A = BASE_A + "~tplv-xxx-image_pre_watermark_1_5.png?sig=2"
+        FULL_B = BASE_B + "~tplv-xxx-image_pre_watermark_1_5.png?sig=3"
+        page.set_content(
+            f'<div><img src="{PREVIEW_A}">'
+            f'<img src="{FULL_A}">'
+            f'<img src="data:image/png;base64,AAAA">'
+            f'<img src="{FULL_B}"></div>'
+        )
+        got = page.evaluate(_FULLSIZE_JS, {"marker": "image_pre_watermark"})
+        assert got.get(BASE_A) == FULL_A, got
+        assert got.get(BASE_B) == FULL_B, got
+        assert len(got) == 2, got   # data: bị bỏ, preview không chứa marker
+        # Python-side matching trong _upgrade_to_fullsize: base khớp -> dùng bản gốc,
+        # base thiếu (viewer chưa load) -> giữ preview
+        out = [got.get(b, p) for b, p in {BASE_A: PREVIEW_A,
+                                          "https://cdn.example.com/rc_gen_image/missing.jpeg": "preview-missing"}.items()]
+        assert out[0] == FULL_A and out[1] == "preview-missing", out
+        passed += 1
+        print("PASS 11: full-size marker map (base -> image_pre_watermark URL)")
     finally:
         browser.close()
         pw.stop()
 
-    print(f"\n{passed}/10 tests passed")
-    return 0 if passed == 10 else 1
+    print(f"\n{passed}/11 tests passed")
+    return 0 if passed == 11 else 1
 
 
 if __name__ == "__main__":

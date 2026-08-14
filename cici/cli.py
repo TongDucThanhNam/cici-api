@@ -169,12 +169,20 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                 )
             )
         return api.EXIT_QUOTA
-    except ValueError as e:  # invalid model alias
-        out_console.print(f"[red]✗ {e}[/]\n[dim]Chạy `cici models` để xem alias hợp lệ.[/]")
+    except ValueError as e:  # invalid model alias / prompt
+        if as_json:
+            _emit_json({"status": "FAILED", "error": str(e),
+                        "hint": "Chạy `cici models` để xem alias hợp lệ."})
+        else:
+            out_console.print(f"[red]✗ {e}[/]\n[dim]Chạy `cici models` để xem alias hợp lệ.[/]")
         return api.EXIT_FAILED
-    except Exception as e:  # noqa: BLE001
-        out_console.print(f"[red]Lỗi khi enqueue job: {e}[/]")
-        return api.EXIT_FAILED
+    except Exception as e:  # noqa: BLE001 — server chết / mất kết nối lúc enqueue
+        if as_json:
+            _emit_json({"status": "ENQUEUE_ERROR", "error": str(e),
+                        "hint": "core server không trả lời khi enqueue — thử lại khi server lên lại"})
+        else:
+            out_console.print(f"[red]Lỗi khi enqueue job: {e}[/]")
+        return api.EXIT_PREFLIGHT
 
     job_id = resp["job_id"]
     # server trả timeout thật (theo config.yaml timing) — dùng thay vì fallback

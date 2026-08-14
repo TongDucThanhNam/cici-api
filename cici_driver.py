@@ -134,11 +134,15 @@ _SNAPSHOT_JS = r"""({sel}) => {
 #      create-image). Diff media hiện có với snapshot trước send -> media mới.
 # Trả text (bot messages mới / body text) để detect quota-exhausted TRƯỚC khi
 # coi là success/timeout.
-_POLL_RESULT_JS = r"""({sel, before, mediaBefore}) => {
+_POLL_RESULT_JS = r"""({sel, before, mediaBefore, kind}) => {
     const collectVideos = (root) => {
         const out = [];
         root.querySelectorAll('video').forEach(v => {
             const s = v.currentSrc || v.src || '';
+            if (s && !s.startsWith('data:') && !s.startsWith('blob:')) out.push(s);
+        });
+        root.querySelectorAll('video source').forEach(v => {
+            const s = v.src || '';
             if (s && !s.startsWith('data:') && !s.startsWith('blob:')) out.push(s);
         });
         return out;
@@ -158,7 +162,7 @@ _POLL_RESULT_JS = r"""({sel, before, mediaBefore}) => {
         if (newOnes.length === 0)
             return {mode: 'chat', recv: recvs.length, newRecv: 0, done: false, urls: [], text: ''};
         const last = newOnes[newOnes.length - 1];
-        const done = !!last.querySelector(sel.done_indicator);
+        let done = !!last.querySelector(sel.done_indicator);
         const imgs = [];
         const videos = [];
         let videoBlocks = 0;
@@ -170,29 +174,57 @@ _POLL_RESULT_JS = r"""({sel, before, mediaBefore}) => {
             videoBlocks += m.querySelectorAll(sel.result_video).length;
             videos.push(...collectVideos(m));
         });
-        if (videos.length === 0 && videoBlocks > 0) {
-            newOnes.forEach(m => clickUnloadedVideoBlocks(m));
+        if (kind === 'video') {
+            if (videos.length === 0 && videoBlocks > 0) {
+                newOnes.forEach(m => clickUnloadedVideoBlocks(m));
+            }
+            const text = newOnes.map(m => (m.innerText || '')).join('\n').slice(0, 800);
+            return {
+                mode: 'chat', recv: recvs.length, newRecv: newOnes.length,
+                done: done && videos.length > 0,
+                urls: videos, videoBlocks, text,
+            };
         }
         const text = newOnes.map(m => (m.innerText || '')).join('\n').slice(0, 800);
         return {
             mode: 'chat', recv: recvs.length, newRecv: newOnes.length, done,
-            urls: imgs.concat(videos), videoBlocks, text,
+            urls: imgs, videoBlocks, text,
         };
     }
     // --- branch B: inline (trang create-image, không có message list) ---
     clickUnloadedVideoBlocks(document);
     const current = [];
-    document.querySelectorAll(sel.result_image).forEach(i => {
-        const s = i.currentSrc || i.src || '';
-        if (s && !s.startsWith('data:')) current.push(s);
-    });
-    current.push(...collectVideos(document));
+    if (kind === 'video') {
+        current.push(...collectVideos(document));
+    } else {
+        document.querySelectorAll(sel.result_image).forEach(i => {
+            const s = i.currentSrc || i.src || '';
+            if (s && !s.startsWith('data:')) current.push(s);
+        });
+    }
     const newMedia = current.filter(u => mediaBefore.indexOf(u) === -1);
     return {
         mode: 'inline', newRecv: 1, done: newMedia.length > 0,
         urls: newMedia,
         text: (document.body.innerText || '').slice(0, 800),
     };
+}"""
+
+
+# Thu thập URL ảnh GỐC (full-size) từ image viewer. Preview trong chat dùng
+# template `downsize_watermark` (nhỏ + watermark to); bản gốc do viewer lazy-load
+# khi click ảnh (template `image_pre_watermark`, vd 1773x2364). Match theo base
+# path (URL trước '~tplv') của các preview URL của job NÀY — không lấy nhầm
+# ảnh job khác. Trả map base -> url gốc cho mọi ảnh đang có trên trang.
+_FULLSIZE_JS = r"""({marker}) => {
+    const out = {};
+    document.querySelectorAll('img').forEach(i => {
+        const s = i.currentSrc || i.src || '';
+        if (!s || s.startsWith('data:') || s.indexOf(marker) === -1) return;
+        const base = s.split('~tplv')[0];
+        if (!out[base]) out[base] = s;   // ưu tiên bản đầu tiên (viewer)
+    });
+    return out;
 }"""
 
 
@@ -474,7 +506,7 @@ class CiciDriver:
         while time.time() < deadline:
             res = await page.evaluate(
                 _POLL_RESULT_JS,
-                {"sel": self.sel, "before": bot_count_before, "mediaBefore": media_before},
+                {"sel": self.sel, "before": bot_count_before, "mediaBefore": media_before, "kind": kind},
             )
             # detect quota-exhausted message BEFORE treating as success/timeout
             if _quota and res.get("text") and _quota.is_exhausted_message(res["text"]):
@@ -503,6 +535,105 @@ class CiciDriver:
                         stable_polls = 0
             await asyncio.sleep(interval)
         raise TimeoutError(f"No result within {timeout}s")
+
+    async def _upgrade_to_fullsize(self, preview_urls: list[str],
+                                   bot_count_before: int = 0) -> list[str]:
+        """Đổi preview URL (downsize_watermark, ~288px) lấy ảnh GỐC full-size.
+
+        Cơ chế (verify build 147.0.7727.149): click TỪNG ảnh kết quả → image
+        viewer lazy-load bản `image_pre_watermark` (full-res, vd 1773x2364) cho
+        ảnh đó → Escape đóng → ảnh kế. Viewer chỉ render 1 img full-size trong
+        DOM (arrow keys không điều hướng) nên phải lặp qua từng box. Network
+        listener bắt thêm các URL viewer prefetch. Match theo base path (URL
+        trước '~tplv') của preview URL — không lấy nhầm ảnh job khác.
+
+        Fail-safe: mọi bước bọc try/except — nếu viewer không mở / marker đổi /
+        timeout thì trả lại preview URLs (kết quả cũ vẫn dùng được).
+        """
+        marker = self.sel.get("fullsize_image_marker", "")
+        if not marker or not preview_urls:
+            return preview_urls
+        bases = {u.split("~tplv")[0]: u for u in preview_urls if "~tplv" in u}
+        if not bases:
+            return preview_urls
+        page = await self._ensure_page()
+        got: dict[str, str] = {}
+
+        def _on_request(req) -> None:
+            u = req.url
+            if marker in u:
+                base = u.split("~tplv")[0]
+                if base in bases:
+                    got.setdefault(base, u)
+
+        try:
+            page.on("request", _on_request)
+            n_boxes = await page.evaluate(
+                """([sel, before]) => {
+                    const ml = document.querySelector(sel.message_list);
+                    let scope = ml
+                        ? Array.from(ml.querySelectorAll(sel.bot_message)).slice(before)[-1]
+                        : document;
+                    if (!scope || !scope.querySelectorAll) scope = document;
+                    return scope.querySelectorAll(sel.result_image).length;
+                }""",
+                [self.sel, bot_count_before],
+            )
+            if not n_boxes:
+                return preview_urls
+            overall = time.time() + self.tm.get("fullsize_wait", 30)
+            each = self.tm.get("fullsize_each_wait", 5)
+            for i in range(n_boxes):
+                if all(b in got for b in bases) or time.time() > overall:
+                    break
+                opened = await page.evaluate(
+                    """([sel, before, i]) => {
+                        const ml = document.querySelector(sel.message_list);
+                        let scope = ml
+                            ? Array.from(ml.querySelectorAll(sel.bot_message)).slice(before)[-1]
+                            : document;
+                        if (!scope || !scope.querySelectorAll) scope = document;
+                        const boxes = scope.querySelectorAll(sel.result_image);
+                        if (boxes[i]) { boxes[i].click(); return true; }
+                        return false;
+                    }""",
+                    [self.sel, bot_count_before, i],
+                )
+                if not opened:
+                    break
+                # chờ bản full-size của ảnh này xuất hiện (DOM hoặc network)
+                sub_deadline = time.time() + each
+                before_count = len(got)
+                while time.time() < sub_deadline:
+                    for base, u in (await page.evaluate(
+                            _FULLSIZE_JS, {"marker": marker})).items():
+                        if base in bases:
+                            got.setdefault(base, u)
+                    if len(got) > before_count or all(b in got for b in bases):
+                        break
+                    await asyncio.sleep(0.4)
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(self.tm.get("viewer_close_delay", 0.6))
+            if not got:
+                return preview_urls
+            out = []
+            for base, preview in bases.items():
+                out.append(got.get(base, preview))
+            upgraded = sum(1 for b in bases if b in got)
+            log.info("Full-size upgrade: %d/%d ảnh gốc thu được", upgraded, len(bases))
+            return out
+        except Exception as e:  # noqa: BLE001 — upgrade là best-effort
+            log.warning("Full-size upgrade failed (%s) — dùng preview URLs", e)
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return preview_urls
+        finally:
+            try:
+                page.remove_listener("request", _on_request)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- high-level job execution --------------------------------------- #
     async def execute(self, job: Job) -> dict[str, Any]:
@@ -534,6 +665,9 @@ class CiciDriver:
                     timeout, kind=job.kind,
                     bot_count_before=bot_count_before, media_before=media_before,
                 )
+                # ảnh: nâng lên bản gốc full-size (viewer lazy-load) — best-effort
+                if job.kind == "image":
+                    urls = await self._upgrade_to_fullsize(urls, bot_count_before)
                 # success → record quota
                 if _quota:
                     state = _quota.load()

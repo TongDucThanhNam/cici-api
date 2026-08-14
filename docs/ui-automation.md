@@ -40,6 +40,18 @@ Dola build **Chrome/147.0.7727.149**:
   `img`; the `<video>` element (src on `v16-dola.dola.com`) is lazily created by
   xgplayer **only after the block is clicked**. `_wait_result` clicks unloaded
   blocks and reads `video.src` on a later poll. Video URLs carry no `x-expires`.
+- Chat image results render two `<img>` per `mdbox_image`: an SVG placeholder
+  declaring the full dimensions plus the preview (`~tplv-…-downsize_watermark`,
+  ~288px). The **full-size original** (`~tplv-…-image_pre_watermark`, e.g.
+  1773×2364) is only instantiated when the image viewer is open, one image at
+  a time (arrow keys do NOT navigate; siblings are only network-prefetched).
+  After `_wait_result` succeeds on an image job, `_upgrade_to_fullsize` clicks
+  each result box, reads the viewer URL (DOM via `_FULLSIZE_JS` + page request
+  listener), presses Escape, and repeats — matching each URL by its base path
+  (before `~tplv`) so other jobs' images can't leak in. Marker lives in
+  `selectors.fullsize_image_marker`; timings in `timing.fullsize_wait` /
+  `fullsize_each_wait` / `viewer_close_delay`. Any failure falls back to the
+  preview URLs — the job still completes.
 
 ## Selector-change workflow
 

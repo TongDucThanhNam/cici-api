@@ -66,6 +66,10 @@ selectors:
   done_indicator: '[data-testid="message_action_bar"]'
   # Ảnh kết quả (src chứa rc_gen_image / ocean-flow / tos-mya)
   result_image: '[data-testid="mdbox_image"] img'
+  # Marker template của ảnh GỐC full-size mà image viewer lazy-load khi click
+  # (preview trong chat là downsize_watermark ~288px; bản gốc là image_pre_watermark,
+  # verify build 147.0.7727.149: 1773x2364). Đổi khi Cici đổi template.
+  fullsize_image_marker: "image_pre_watermark"
   # Video kết quả: block video trong bot message. Chứa img.cover (thumbnail);
   # <video src> CHỈ được tạo khi click vào block (xgplayer lazy-init) -> driver click rồi đọc src.
   result_video: 'div[class*="block-video"]'
@@ -184,6 +188,13 @@ timing:
   editor_focus_delay: 0.3
   # Delay sau khi click tab Hình ảnh/Video trên trang create-image
   tab_delay: 1.0
+  # Chờ tối đa (s) TỔNG cho việc thu thập ảnh gốc full-size (click từng ảnh mở
+  # viewer, mỗi ảnh vài giây — 4 ảnh thực tế ~12s, chừa dư cho 10 ảnh)
+  fullsize_wait: 60
+  # Chờ tối đa (s) MỖI ảnh cho viewer lazy-load bản gốc
+  fullsize_each_wait: 5
+  # Delay sau khi Escape đóng image viewer
+  viewer_close_delay: 0.6
 
 concurrency:
   # Worker đơn luồng — Cici chỉ có 1 ô chat, bắt buộc xử lý tuần tự.

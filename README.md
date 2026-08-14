@@ -251,7 +251,15 @@ State lưu ở `~/.cici/quota.json`. Xoá file đó để reset.
 
 ### Agent integration note
 
-Khi agent gọi `cici image`, lệnh **block ~2-3 phút**. Agent cần set tool timeout cao (≥ 320s) hoặc dùng `cici image --json` và đọc stdout. URL kết quả có `x-expires` (parse sẵn trong `--json` field `expires_local`) — nhưng giá trị thường xa 10 năm nên không lo sớm hết hạn.
+Khi agent gọi `cici image`, lệnh **block ~2-4 phút**. Agent cần set tool timeout cao (≥ 320s) hoặc dùng `cici image --json` và đọc stdout. URL kết quả có `x-expires` (parse sẵn trong `--json` field `expires_local`) — nhưng giá trị thường xa 10 năm nên không lo sớm hết hạn.
+
+**Chất lượng ảnh trả về:** driver tự nâng URL từ preview (~288px, watermark lớn)
+lên **ảnh gốc full-size** (vd 1773×2364) bằng cách mở image viewer của từng ảnh
+(template `image_pre_watermark` trong `config.yaml`). Nếu Cici đổi viewer/tool
+lấy không được, job vẫn COMPLETED với URL preview (fallback) — log ghi rõ
+`Full-size upgrade: N/M`. Ảnh gốc vẫn còn watermark nhỏ "AI generated" ở góc —
+đây là watermark do Cici áp lên chính file gốc, không có bản no-watermark qua
+UI này.
 
 Override core URL (mặc định `http://127.0.0.1:8000`):
 ```bash

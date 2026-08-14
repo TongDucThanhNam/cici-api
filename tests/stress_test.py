@@ -694,17 +694,18 @@ def s8_server_death_midpoll() -> None:
              "--base", base2, "image", "s8a midpoll death", "--json"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        # chờ job vào PROCESSING rồi +1s cho CLI kịp poll lần đầu
-        deadline = time.time() + 10
+        # chờ CLI kịp enqueue job của nó (server2 có 2 jobs) rồi +0.5s cho CLI
+        # bắt đầu poll — tránh race kill trước khi CLI enqueue
+        deadline = time.time() + 30
         while time.time() < deadline:
             try:
-                s = httpx.get(f"{base2}/api/status/{job_id}", timeout=3).json()
+                jobs = httpx.get(f"{base2}/api/jobs", timeout=3).json().get("jobs", [])
+                if len(jobs) >= 2:
+                    break
             except Exception:  # noqa: BLE001
                 break
-            if s.get("status") == "PROCESSING":
-                break
-            time.sleep(0.1)
-        time.sleep(1.0)
+            time.sleep(0.2)
+        time.sleep(0.5)
         srv2.should_exit = True
         th2.join(timeout=10)
         time.sleep(0.3)
