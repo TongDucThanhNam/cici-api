@@ -40,6 +40,28 @@ class QuotaExhausted(Exception):
         self.kind = kind
         self.raw_message = message
 
+
+class ContentBlocked(Exception):
+    """Cici ĐÃ gen xong nhưng TỪ CHỐI hiển thị kết quả (bản quyền / content policy).
+
+    Match refusal patterns (config.yaml messages.refusal_patterns) trong bot
+    response. Driver fail nhanh thay vì spin tới timeout.
+    """
+    def __init__(self, message: str, kind: str):
+        super().__init__(message)
+        self.kind = kind
+        self.raw_message = message
+
+
+# Fallback refusal patterns nếu config thiếu messages.refusal_patterns.
+# (Wording Cici có thể đổi — thêm vào config.yaml khi thấy pattern mới.)
+_DEFAULT_REFUSAL_PATTERNS = [
+    "bảo vệ bản quyền",
+    "bản quyền",
+    "to protect copyright",
+    "copyright",
+]
+
 log = logging.getLogger("cici.driver")
 
 
@@ -61,6 +83,9 @@ class Job:
     prompt: str
     model: str | None = None   # alias trong config.yaml models.<kind>.options[].alias
     references: list[str] = field(default_factory=list)  # local file paths for reference-image gen
+    ratio: str | None = None       # alias config.yaml options.<kind>.ratios[].alias (vd "16:9")
+    style: str | None = None       # alias options.image.styles[].alias (image only)
+    duration: str | None = None    # alias options.video.durations[].alias (video only, "5s"/"10s")
     created_at: float = field(default_factory=time.time)
 
 
@@ -77,6 +102,101 @@ class JobStore:
 
 
 # --------------------------------------------------------------------------- #
+# Result-polling JS (module constants — importable để test deterministic)
+# --------------------------------------------------------------------------- #
+# Snapshot trước khi send: số bot messages hiện có + set media URL hiện có trên
+# trang (để nhánh inline diff ra media MỚI xuất hiện sau send).
+_SNAPSHOT_JS = r"""({sel}) => {
+    const ml = document.querySelector(sel.message_list);
+    const before = ml ? ml.querySelectorAll(sel.bot_message).length : 0;
+    const media = [];
+    document.querySelectorAll(sel.result_image).forEach(i => {
+        const s = i.currentSrc || i.src || '';
+        if (s && !s.startsWith('data:')) media.push(s);
+    });
+    document.querySelectorAll(sel.result_video).forEach(b => {
+        const v = b.querySelector('video');
+        if (v) {
+            const s = v.currentSrc || v.src || '';
+            if (s && !s.startsWith('data:') && !s.startsWith('blob:')) media.push(s);
+        }
+    });
+    return {before, media};
+}"""
+
+# Poll kết quả. Hai nhánh:
+#   A. chat: trang có message-list (sau send app navigate sang conversation mới).
+#      Chỉ nhìn bot messages MỚI (index >= before) — race-safe. Collect ảnh
+#      (result_image) + video (result_video): <video> lazy-init khi click block,
+#      nên poll này click các block chưa có player; poll sau đọc src.
+#      'Done' = bot message MỚI NHẤT có action bar.
+#   B. inline: trang không có message-list (kết quả hiện ngay trên trang
+#      create-image). Diff media hiện có với snapshot trước send -> media mới.
+# Trả text (bot messages mới / body text) để detect quota-exhausted TRƯỚC khi
+# coi là success/timeout.
+_POLL_RESULT_JS = r"""({sel, before, mediaBefore}) => {
+    const collectVideos = (root) => {
+        const out = [];
+        root.querySelectorAll('video').forEach(v => {
+            const s = v.currentSrc || v.src || '';
+            if (s && !s.startsWith('data:') && !s.startsWith('blob:')) out.push(s);
+        });
+        return out;
+    };
+    const clickUnloadedVideoBlocks = (root) => {
+        root.querySelectorAll(sel.result_video).forEach(b => {
+            if (!b.querySelector('video')) {
+                try { b.click(); } catch (e) {}
+            }
+        });
+    };
+    const ml = document.querySelector(sel.message_list);
+    if (ml) {
+        // --- branch A: conversation message list ---
+        const recvs = Array.from(ml.querySelectorAll(sel.bot_message));
+        const newOnes = recvs.slice(before);
+        if (newOnes.length === 0)
+            return {mode: 'chat', recv: recvs.length, newRecv: 0, done: false, urls: [], text: ''};
+        const last = newOnes[newOnes.length - 1];
+        const done = !!last.querySelector(sel.done_indicator);
+        const imgs = [];
+        const videos = [];
+        let videoBlocks = 0;
+        newOnes.forEach(m => {
+            m.querySelectorAll(sel.result_image).forEach(i => {
+                const s = i.currentSrc || i.src || '';
+                if (s && !s.startsWith('data:')) imgs.push(s);
+            });
+            videoBlocks += m.querySelectorAll(sel.result_video).length;
+            videos.push(...collectVideos(m));
+        });
+        if (videos.length === 0 && videoBlocks > 0) {
+            newOnes.forEach(m => clickUnloadedVideoBlocks(m));
+        }
+        const text = newOnes.map(m => (m.innerText || '')).join('\n').slice(0, 800);
+        return {
+            mode: 'chat', recv: recvs.length, newRecv: newOnes.length, done,
+            urls: imgs.concat(videos), videoBlocks, text,
+        };
+    }
+    // --- branch B: inline (trang create-image, không có message list) ---
+    clickUnloadedVideoBlocks(document);
+    const current = [];
+    document.querySelectorAll(sel.result_image).forEach(i => {
+        const s = i.currentSrc || i.src || '';
+        if (s && !s.startsWith('data:')) current.push(s);
+    });
+    current.push(...collectVideos(document));
+    const newMedia = current.filter(u => mediaBefore.indexOf(u) === -1);
+    return {
+        mode: 'inline', newRecv: 1, done: newMedia.length > 0,
+        urls: newMedia,
+        text: (document.body.innerText || '').slice(0, 800),
+    };
+}"""
+
+
+# --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
 class CiciDriver:
@@ -88,22 +208,44 @@ class CiciDriver:
         self._browser: Optional[Browser] = None
         self._page: Optional[Page] = None
         self._lock = asyncio.Lock()  # serialize all UI ops
+        # refusal patterns: Cici từ chối kết quả (bản quyền / content policy).
+        # Load từ config; fallback default nếu thiếu.
+        self.refusal_patterns: list[str] = (
+            cfg.get("messages", {}).get("refusal_patterns") or _DEFAULT_REFUSAL_PATTERNS
+        )
+
+    def _is_refusal_message(self, text: str) -> bool:
+        """Cici từ chối hiển thị kết quả (bản quyền / content policy)?
+
+        Match case-insensitive substring với refusal_patterns trong config.
+        """
+        if not text:
+            return False
+        low = text.lower()
+        return any(p.lower() in low for p in self.refusal_patterns)
 
     # ---- connection lifecycle ------------------------------------------- #
     async def connect(self) -> None:
-        cdp = self.cfg["cdp"]
-        self._pw = await async_playwright().start()
-        await self._attach()
+        """Start Playwright (chưa nối CDP — attach lazy khi cần). Idempotent."""
+        if self._pw is None:
+            self._pw = await async_playwright().start()
 
-    async def _attach(self) -> None:
-        """Connect/reconnect to the running Cici and locate the chat page."""
+    async def _attach(self, timeout: float | None = None) -> None:
+        """Connect/reconnect to the running Cici and locate the chat page.
+
+        Retry với backoff. Nếu vượt `timeout` (giây) mà vẫn chưa nối được →
+        raise ConnectionError để job FAILED nhanh thay vì treo cả queue.
+        Mặc định dùng `cdp.connect_timeout` từ config.
+        """
+        await self.connect()
         cdp = self.cfg["cdp"]
+        budget = timeout if timeout is not None else cdp.get("connect_timeout", 90)
+        deadline = time.monotonic() + budget
         delay = cdp["reconnect_initial_delay"]
         mx = cdp["reconnect_max_delay"]
-        last_err = None
         while True:
             try:
-                self._browser = await self._pw.chromium.connect_over_cdp(cdp["endpoint"])
+                self._browser = await self._pw.chromium.connect_over_cdp(cdp["endpoint"])  # type: ignore[union-attr]
                 pat = cdp["chat_url_pattern"]
                 page = None
                 for ctx in self._browser.contexts:
@@ -119,7 +261,11 @@ class CiciDriver:
                 log.info("Connected to Cici chat page: %s", page.url)
                 return
             except Exception as e:  # noqa: BLE001
-                last_err = e
+                if time.monotonic() >= deadline:
+                    raise ConnectionError(
+                        f"Cici CDP ({cdp['endpoint']}) không nối được sau {budget:.0f}s: {e}. "
+                        "Kiểm tra Cici đang chạy với --remote-debugging-port=9222 (start_cici.bat)."
+                    ) from e
                 log.warning("CDP connect failed (%s); retry in %ss", e, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, mx)
@@ -135,6 +281,24 @@ class CiciDriver:
             await self._attach()
         return self._page  # type: ignore[return-value]
 
+    async def recover(self, timeout: float = 30.0) -> None:
+        """Best-effort phục hồi UI sau lỗi/hard-deadline (reload trang chat).
+
+        Nuốt mọi lỗi — mục tiêu chỉ là không để job KẾ TIẾP thừa trạng thái xấu.
+        """
+        try:
+            if self._page is not None:
+                try:
+                    await self._page.title()
+                except Exception:  # noqa: BLE001
+                    await self._attach(timeout=timeout)
+            else:
+                await self._attach(timeout=timeout)
+            if self._page is not None:
+                await self._page.reload(wait_until="domcontentloaded", timeout=30000)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---- low-level UI helpers ------------------------------------------- #
     async def _new_conversation(self) -> None:
         page = await self._ensure_page()
@@ -145,16 +309,35 @@ class CiciDriver:
         await asyncio.sleep(self.tm["ui_step_delay"])
 
     async def _select_skill(self, kind: str) -> None:
+        """Legacy flow (build <= 147.0.7727.89): click skill button trong skill bar."""
         page = await self._ensure_page()
         sel = self.sel["skill_image"] if kind == "image" else self.sel["skill_video"]
         await page.locator(sel).click()
         await asyncio.sleep(self.tm["ui_step_delay"])
 
-    def _resolve_model(self, kind: str, alias: str | None) -> dict | None:
-        """Look up model option in cfg['models'][kind]. Returns option dict or None."""
+    async def _enter_creation_page(self, kind: str) -> None:
+        """Entry chính (build 147.0.7727.149+): trang create-image ("Tác phẩm của AI").
+
+        Fresh conversation không còn skill bar, nên vào thẳng trang tạo ảnh/video
+        rồi chọn tab. Raise Playwright TimeoutError nếu tab không xuất hiện
+        → caller fallback legacy flow.
+        """
+        page = await self._ensure_page()
+        url = self.cfg["cdp"]["create_image_url"]
+        if page.url != url:
+            await page.goto(url, wait_until="domcontentloaded")
+            await asyncio.sleep(self.tm["ui_step_delay"])
+        tab = self.sel["creation_tab_image" if kind == "image" else "creation_tab_video"]
+        tab_loc = page.locator('[data-testid="chat_input"]').locator(tab).first
+        await tab_loc.wait_for(state="visible", timeout=10000)
+        await tab_loc.click()
+        await asyncio.sleep(self.tm.get("tab_delay", self.tm["ui_step_delay"]))
+
+    def _resolve_model(self, kind: str, alias: str | None) -> dict:
+        """Look up model option in cfg['models'][kind]. Alias None → default."""
         registry = self.cfg.get("models", {}).get(kind, {})
-        if not alias or alias == registry.get("default"):
-            return None  # default already selected in UI, no action needed
+        if not alias:
+            alias = registry.get("default")
         for opt in registry.get("options", []):
             if opt["alias"] == alias:
                 return opt
@@ -163,27 +346,51 @@ class CiciDriver:
             f"Valid: {[o['alias'] for o in registry.get('options', [])]}"
         )
 
+    def _resolve_option(self, kind: str, group: str, alias: str) -> dict:
+        """Look up an option in cfg['options'][kind][group] (ratios/styles/durations)."""
+        opts = self.cfg.get("options", {}).get(kind, {}).get(group, [])
+        for o in opts:
+            if o["alias"] == alias:
+                return o
+        raise ValueError(
+            f"Unknown {group} '{alias}' for kind '{kind}'. "
+            f"Valid: {[o['alias'] for o in opts]}"
+        )
+
     async def _select_model(self, kind: str, alias: str | None) -> None:
-        """Open model dropdown + click option matching alias. No-op if default/None."""
+        """Open model dropdown + click option. LUÔN chọn (kể cả default) —
+        UI giữ model chọn lần cuối, không tin trạng thái mặc định."""
         opt = self._resolve_model(kind, alias)
-        if opt is None:
-            return
         page = await self._ensure_page()
-        # Click "Model" button to open dropdown
-        await page.get_by_role("main").locator(self.sel["model_button"]).first.click()
-        await asyncio.sleep(0.6)
-        # Click the option whose text contains select_text
-        option = page.locator(self.sel["model_option"], has_text=opt["select_text"]).first
-        await option.click()
+        await page.locator('[data-testid="chat_input"]').locator(
+            self.sel["model_button"]
+        ).first.click()
+        await asyncio.sleep(self.tm.get("dropdown_delay", 0.6))
+        # Radix menu render ở body level (popper wrapper), không nằm trong chat_input
+        await page.locator(self.sel["model_option"], has_text=opt["select_text"]).first.click()
+        await asyncio.sleep(self.tm["ui_step_delay"])
+
+    async def _select_dropdown(self, kind: str, group: str, alias: str,
+                               button_sel: str) -> None:
+        """Chọn 1 option trong dropdown (ratios/styles/durations)."""
+        opt = self._resolve_option(kind, group, alias)
+        page = await self._ensure_page()
+        await page.locator('[data-testid="chat_input"]').locator(
+            button_sel
+        ).first.click()
+        await asyncio.sleep(self.tm.get("dropdown_delay", 0.6))
+        await page.locator(self.sel["model_option"], has_text=opt["select_text"]).first.click()
         await asyncio.sleep(self.tm["ui_step_delay"])
 
     async def _upload_references(self, paths: list[str]) -> None:
-        """Upload reference images.
+        """Upload reference images (image + video tab).
 
         UI thay đổi theo version Cici — thử nhiều cách theo thứ tự:
-          1. UI mới (>=147.0.7727.149): mở modal Templates → set_input_files vào
-             input ẩn (đã verify inputFilesCount=1) → đóng modal (Escape).
-          2. UI cũ: click nút "Reference Image" → filechooser event → set_files.
+          1. UI mới (>=147.0.7727.149, chat skill mode): mở modal Templates
+             ("Templates"/"Mẫu") → set_input_files vào input ẩn → đóng modal.
+          2. Nút "Reference Image" → native filechooser → set_files.
+             (Trên trang create-image build .149, đây là đường chính — đã verify
+             nút mở native chooser.)
         """
         if not paths:
             return
@@ -194,25 +401,27 @@ class CiciDriver:
         page = await self._ensure_page()
         main = page.get_by_role("main")
 
-        # --- approach 1: new UI — Templates modal + hidden upload input ---
-        try:
-            tpl = main.locator('button', has_text="Templates").first
-            await tpl.click(timeout=5000)
-            await asyncio.sleep(1.5)
-            fi = page.locator('input[type="file"]').first
-            await fi.set_input_files(paths, timeout=5000)
-            await asyncio.sleep(2.0)
-            # đóng modal để quay lại input chính
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(1.0)
-            log.info("Uploaded %d reference(s) via Templates modal", len(paths))
-            return
-        except Exception as e:  # noqa: BLE001
-            log.info("New-UI upload failed (%s); falling back to old ref button", e)
+        # --- approach 1: Templates modal + hidden upload input ---
+        tpl_texts = self.sel.get("templates_button_texts", ["Templates", "Mẫu"])
+        for txt in tpl_texts:
+            try:
+                tpl = main.locator('button', has_text=txt).first
+                await tpl.click(timeout=5000)
+                await asyncio.sleep(self.tm.get("modal_open_delay", 1.5))
+                fi = page.locator('input[type="file"]').first
+                await fi.set_input_files(paths, timeout=5000)
+                await asyncio.sleep(self.tm.get("modal_upload_delay", 2.0))
+                # đóng modal để quay lại input chính
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(self.tm.get("modal_close_delay", 1.0))
+                log.info("Uploaded %d reference(s) via Templates modal (%r)", len(paths), txt)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.info("Templates-modal upload (%r) failed (%s); trying next", txt, e)
 
-        # --- approach 2: old UI — Reference Image button + filechooser ---
+        # --- approach 2: Reference Image button + filechooser ---
         async with page.expect_file_chooser(timeout=5000) as fc_info:
-            await main.locator(self.sel["ref_button"]).click()
+            await page.locator(self.sel["ref_button"]).first.click()
         chooser = await fc_info.value
         await chooser.set_files(paths)
         await asyncio.sleep(max(self.tm["ui_step_delay"], 1.5))
@@ -221,85 +430,77 @@ class CiciDriver:
     async def _type_prompt(self, prompt: str) -> None:
         """In skill mode the input is a contenteditable TiPTap; fallback to textarea."""
         page = await self._ensure_page()
-        editor = page.get_by_role("main").locator(self.sel["editor_prose"]).last
+        inp = page.locator('[data-testid="chat_input"]').first
+        editor = inp.locator(self.sel["editor_prose"]).last
         try:
             await editor.wait_for(state="visible", timeout=8000)
             await editor.click()
-            await asyncio.sleep(0.3)
-            await page.get_by_role("main").locator(self.sel["editor_prose"]).last.type(
-                prompt, delay=8
-            )
-        except (PWTimeoutError, Exception):
-            ta = page.get_by_role("main").locator(self.sel["chat_textarea"]).last
+            await asyncio.sleep(self.tm.get("editor_focus_delay", 0.3))
+            await inp.locator(self.sel["editor_prose"]).last.type(prompt, delay=8)
+        except Exception:  # noqa: BLE001
+            ta = inp.locator(self.sel["chat_textarea"]).last
             await ta.wait_for(state="visible", timeout=10000)
             await ta.fill(prompt)
 
-    async def _send(self) -> int:
-        """Click send. Trả về số bot messages có TRƯỚC khi gửi,
-        để _wait_result biết phải chờ tới khi nào (race-safe)."""
+    async def _send(self) -> tuple[int, list[str]]:
+        """Click send. Trả về (số bot messages TRƯỚC khi gửi, snapshot media URL
+        trên trang trước khi gửi) để _wait_result chờ đúng kết quả job này (race-safe)."""
         page = await self._ensure_page()
-        # đếm bot messages hiện có trước khi send
-        before = await page.evaluate(
-            r"""(sel) => {
-                const ml = document.querySelector(sel.message_list);
-                return ml ? ml.querySelectorAll(sel.bot_message).length : 0;
-            }""",
-            self.sel,
-        )
-        await page.get_by_role("main").locator(self.sel["send_button"]).click()
-        return before
+        snap = await page.evaluate(_SNAPSHOT_JS, {"sel": self.sel})
+        await page.locator('[data-testid="chat_input"]').locator(
+            self.sel["send_button"]
+        ).first.click()
+        return int(snap.get("before", 0)), list(snap.get("media", []))
 
     async def _wait_result(self, timeout: float, kind: str = "image",
-                           bot_count_before: int = 0) -> list[str]:
-        """Poll message-list; return list of generated media URLs when done.
+                           bot_count_before: int = 0,
+                           media_before: list[str] | None = None) -> list[str]:
+        """Poll result; return list of generated media URLs when done.
 
-        Race-safe: chỉ nhìn bot message thứ `bot_count_before + 1` trở đi
-        (message mới do prompt vừa gửi tạo ra), KHÔNG phải "message mới nhất".
-        Tránh pick nhầm result của job trước khi chưa kịp clear, hoặc job khác.
+        Race-safe: branch chat chỉ nhìn bot messages từ index `bot_count_before`
+        trở đi (job hiện tại sinh ra), KHÔNG phải "message mới nhất". Branch inline
+        diff media với snapshot trước send. Video: <video> lazy-init khi click
+        block → poll click trước, poll sau đọc src.
 
-        'Done' = bot message mới chứa action bar (data-testid message_action_bar)
-        AND ít nhất 1 result image.
-        Raises QuotaExhausted nếu bot message chứa text báo hết quota hằng ngày.
+        Raises QuotaExhausted nếu text chứa báo hết quota hằng ngày.
         """
         page = await self._ensure_page()
         deadline = time.time() + timeout
         interval = self.tm["poll_interval"]
+        media_before = media_before or []
         last_url_count = -1
+        last_urls: list[str] | None = None
+        stable_polls = 0
         while time.time() < deadline:
             res = await page.evaluate(
-                r"""({sel, before}) => {
-                    const ml = document.querySelector(sel.message_list);
-                    if (!ml) return {recv: 0, newRecv: 0, done: false, urls: [], text: ''};
-                    const recvs = Array.from(ml.querySelectorAll(sel.bot_message));
-                    // chỉ xét bot messages MỚI hơn thời điểm send (index >= before)
-                    const newOnes = recvs.slice(before);
-                    if (newOnes.length === 0)
-                        return {recv: recvs.length, newRecv: 0, done: false, urls: [], text: ''};
-                    // lấy message mới nhất trong nhóm mới (job này sinh ra)
-                    const last = newOnes[newOnes.length - 1];
-                    const done = !!last.querySelector(sel.done_indicator);
-                    const imgs = Array.from(last.querySelectorAll(sel.result_image))
-                        .map(i => i.currentSrc || i.src || '')
-                        .filter(s => s && !s.startsWith('data:'));
-                    return {
-                        recv: recvs.length,
-                        newRecv: newOnes.length,
-                        done, urls: imgs,
-                        text: (last.innerText||'').slice(0,400)
-                    };
-                }""",
-                {"sel": self.sel, "before": bot_count_before},
+                _POLL_RESULT_JS,
+                {"sel": self.sel, "before": bot_count_before, "mediaBefore": media_before},
             )
             # detect quota-exhausted message BEFORE treating as success/timeout
             if _quota and res.get("text") and _quota.is_exhausted_message(res["text"]):
                 raise QuotaExhausted(res["text"], kind)
-            # phải có ít nhất 1 bot message mới (job này đã được Cici nhận)
-            if res.get("newRecv", 0) > 0 and res["urls"]:
-                if res["done"]:
-                    return res["urls"]
-                # nếu chưa done nhưng số url tăng (Cici đang sinh thêm ảnh)
-                if len(res["urls"]) > last_url_count:
-                    last_url_count = len(res["urls"])
+            # detect content/copyright refusal — Cici gen xong nhưng chặn output.
+            # Fail nhanh thay vì spin tới timeout (bảo vệ quota + thời gian).
+            if res.get("text") and self._is_refusal_message(res["text"]):
+                raise ContentBlocked(res["text"], kind)
+            if res.get("mode") == "chat":
+                # phải có ít nhất 1 bot message mới (job này đã được Cici nhận)
+                if res.get("newRecv", 0) > 0 and res["urls"]:
+                    if res["done"]:
+                        return res["urls"]
+                    # nếu chưa done nhưng số url tăng (Cici đang sinh thêm)
+                    if len(res["urls"]) > last_url_count:
+                        last_url_count = len(res["urls"])
+            else:
+                # inline: media xuất hiện khi gen xong; chờ ổn định 2 poll liên tiếp
+                if res["urls"]:
+                    if res["urls"] == last_urls:
+                        stable_polls += 1
+                        if stable_polls >= 2:
+                            return res["urls"]
+                    else:
+                        last_urls = res["urls"]
+                        stable_polls = 0
             await asyncio.sleep(interval)
         raise TimeoutError(f"No result within {timeout}s")
 
@@ -310,30 +511,44 @@ class CiciDriver:
                 self.tm["image_timeout"] if job.kind == "image" else self.tm["video_timeout"]
             )
             try:
-                # MỖI job = conversation mới → tách biệt hoàn toàn message history.
-                # _new_conversation đã làm việc này; ta chỉ cần capture snapshot
-                # số bot messages TRƯỚC khi send để _wait_result chỉ nhìn message mới.
-                await self._new_conversation()
-                await self._select_skill(job.kind)
+                # Entry chính: trang create-image (build .149+). Fallback legacy
+                # skill flow cho build cũ (skill bar trong conversation).
+                try:
+                    await self._enter_creation_page(job.kind)
+                except Exception as e:  # noqa: BLE001
+                    log.info("create-image entry failed (%s); falling back to legacy skill flow", e)
+                    await self._new_conversation()
+                    await self._select_skill(job.kind)
                 await self._select_model(job.kind, job.model)
+                if job.ratio:
+                    await self._select_dropdown(job.kind, "ratios", job.ratio, self.sel["ratio_button"])
+                if job.kind == "image" and job.style:
+                    await self._select_dropdown(job.kind, "styles", job.style, self.sel["style_button"])
+                if job.kind == "video" and job.duration:
+                    await self._select_dropdown(job.kind, "durations", job.duration, self.sel["duration_button"])
                 if job.references:
                     await self._upload_references(job.references)
                 await self._type_prompt(job.prompt)
-                bot_count_before = await self._send()
+                bot_count_before, media_before = await self._send()
                 urls = await self._wait_result(
-                    timeout, kind=job.kind, bot_count_before=bot_count_before
+                    timeout, kind=job.kind,
+                    bot_count_before=bot_count_before, media_before=media_before,
                 )
                 # success → record quota
                 if _quota:
                     state = _quota.load()
                     _quota.record_success(state, job.kind)
                     _quota.save(state)
-                return {
+                result: dict[str, Any] = {
                     "status": "COMPLETED",
                     "result_urls": urls,
                     "kind": job.kind,
                     "model": job.model or self.cfg["models"][job.kind]["default"],
                 }
+                for k in ("ratio", "style", "duration"):
+                    if getattr(job, k):
+                        result[k] = getattr(job, k)
+                return result
             except QuotaExhausted as e:
                 # quota hết → record limit-hit (auto-learn threshold)
                 if _quota:
@@ -348,14 +563,20 @@ class CiciDriver:
                     "message": e.raw_message,
                     "quota": _quota.snapshot(_quota.load(), job.kind) if _quota else None,
                 }
+            except ContentBlocked as e:
+                # Cici gen xong nhưng từ chối hiển thị kết quả (bản quyền / policy).
+                # Không retry blind — phải đổi nội dung tham chiếu / prompt.
+                log.warning("Job %s CONTENT BLOCKED (kind=%s): %s",
+                            job.job_id, job.kind, e.raw_message[:160])
+                return {
+                    "status": "CONTENT_BLOCKED",
+                    "kind": job.kind,
+                    "message": e.raw_message,
+                }
             except Exception as e:  # noqa: BLE001
                 log.error("Job %s failed: %s", job.job_id, e)
                 # clear zombie state so the next job isn't poisoned
-                try:
-                    page = await self._ensure_page()
-                    await page.reload(wait_until="domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
+                await self.recover()
                 return {"status": "FAILED", "error": str(e)}
 
 
@@ -368,16 +589,33 @@ async def run_worker(
     cfg: dict,
 ) -> None:
     driver = CiciDriver(cfg)
-    log.info("Worker starting; connecting to Cici…")
+    log.info("Worker starting; Playwright up (CDP attach lazily ở job đầu tiên).")
     await driver.connect()
     log.info("Worker ready, waiting for jobs.")
     while True:
         job: Job = await queue.get()
         store.set(job.job_id, status="PROCESSING", started_at=time.time())
         log.info("Processing job %s (%s)", job.job_id, job.kind)
+        # Hard deadline = gen timeout + margin cho UI steps/upload. Bảo vệ queue
+        # khi driver treo ngoài _wait_result (CDP retry, page.evaluate hang…).
+        tm = cfg.get("timing", {})
+        gen_to = tm.get(f"{job.kind}_timeout", 300 if job.kind == "image" else 600)
+        margin = tm.get("hard_deadline_margin", 180)
+        budget = gen_to + margin
         try:
-            result = await driver.execute(job)
+            result = await asyncio.wait_for(driver.execute(job), timeout=budget)
             store.set(job.job_id, finished_at=time.time(), **result)
+        except asyncio.TimeoutError:
+            log.error("Job %s vượt hard deadline %.0fs — recover UI, đánh FAILED", job.job_id, budget)
+            if hasattr(driver, "recover"):
+                await driver.recover()
+            store.set(
+                job.job_id,
+                status="FAILED",
+                error=(f"Job vượt hard deadline {budget:.0f}s (gen {gen_to:.0f}s + margin {margin:.0f}s) — "
+                       "Cici có thể treo hoặc CDP mất. Thử lại job; nếu lặp lại, restart Cici (start_cici.bat)."),
+                finished_at=time.time(),
+            )
         except Exception as e:  # noqa: BLE001  never kill the loop
             log.exception("Unhandled worker error on job %s", job.job_id)
             store.set(job.job_id, status="FAILED", error=str(e), finished_at=time.time())

@@ -59,12 +59,38 @@ class QuotaState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "QuotaState":
-        return cls(
+        if not isinstance(d, dict):
+            return cls()
+        state = cls(
             history=d.get("history", {"image": [], "video": []}),
             threshold=d.get("threshold", {"image": None, "video": None}),
             last_limit_hit=d.get("last_limit_hit", {}),
             window_seconds=d.get("window_seconds", WINDOW_SECONDS),
         )
+        # sanitize: file có thể bị sửa tay / ghi nửa chừng — sai type thì vứt
+        # field đó dùng default, tuyệt đối không để exception lan lên API.
+        if not isinstance(state.history, dict):
+            state.history = {"image": [], "video": []}
+        for k, v in list(state.history.items()):
+            state.history[k] = (
+                [t for t in v if isinstance(t, (int, float)) and not isinstance(t, bool)]
+                if isinstance(v, list) else []
+            )
+        if not isinstance(state.threshold, dict):
+            state.threshold = {"image": None, "video": None}
+        for k, v in list(state.threshold.items()):
+            state.threshold[k] = (
+                v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+            )
+        if not isinstance(state.last_limit_hit, dict):
+            state.last_limit_hit = {}
+        state.last_limit_hit = {
+            k: v for k, v in state.last_limit_hit.items() if isinstance(v, dict)
+        }
+        if (not isinstance(state.window_seconds, (int, float))
+                or isinstance(state.window_seconds, bool) or state.window_seconds <= 0):
+            state.window_seconds = WINDOW_SECONDS
+        return state
 
 
 # --------------------------------------------------------------------------- #
@@ -74,7 +100,9 @@ def load(path: Path = DEFAULT_STATE_PATH) -> QuotaState:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return QuotaState.from_dict(data)
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError):
+        # FileNotFoundError/PermissionError/IsADirectoryError ⊂ OSError;
+        # JSONDecodeError ⊂ ValueError; TypeError/KeyError cho structure sai.
         return QuotaState()
 
 

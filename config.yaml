@@ -1,38 +1,58 @@
 # Cici API Wrapper — central selector & timing config.
 # Khi Cici/Dola đổi UI, CHỈ cần sửa file này — không đụng vào code.
-# Tất cả selector được verify trên Cici build Chromium 147.0.7727.89 (Dola Browser).
+# Selectors được verify trên Cici build Chromium 147.0.7727.149 (Dola Browser).
 
 cdp:
   # Playwright connect_over_cdp target
   endpoint: "http://127.0.0.1:9222"
   # Cici chat tab URL pattern (custom scheme chrome://dola-chat)
   chat_url_pattern: "dola-chat/chat"
+  # Trang tạo ảnh/video chuyên dụng ("Tác phẩm của AI") — entry chính từ build 147.0.7727.149.
+  # Tabs: Hình ảnh / Video + đầy đủ control (model, tỷ lệ, phong cách, thời lượng, ảnh tham chiếu).
+  create_image_url: "chrome://dola-chat/chat/create-image"
   # Reconnect backoff (seconds) khi mất kết nối CDP
   reconnect_initial_delay: 2
   reconnect_max_delay: 30
+  # Ngân sách tối đa (s) để nối/re-nối CDP cho MỘT job trước khi đánh FAILED
+  # (không để job treo PROCESSING vĩnh viễn + block cả queue khi Cici tắt).
+  connect_timeout: 90
 
 selectors:
   # --- Nút "Cuộc trò chuyện mới" (cần scope main vì có 2 instance) ---
   new_conversation: '[data-testid="create_conversation_button"]'
 
-  # --- Skill mode buttons (text: Tạo hình ảnh / Tạo video / Viết / Dịch) ---
+  # --- Skill mode buttons (legacy flow, build <= 147.0.7727.89): text Tạo hình ảnh / Tạo video ---
   skill_image: 'button[data-testid="skill_bar_button_3"]'   # "Tạo hình ảnh"
   skill_video: 'button[data-testid="skill_bar_button_17"]'  # "Tạo video"
 
+  # --- Trang create-image (build 147.0.7727.149+): tab Hình ảnh / Video ---
+  creation_tab_image: '[data-testid="creation-skill-switch-tab-image"]'
+  creation_tab_video: '[data-testid="creation-skill-switch-tab-video"]'
+
   # --- Model selector ---
-  # Nút "Model" trong skill mode (text chứa "Model"), click để mở dropdown (Radix menu).
+  # Nút "Model" trong input (text chứa "Model"), click để mở dropdown (Radix menu).
   # Options: [role="menuitem"], innerText = tên model. Click option matching select_text.
+  # Các dropdown (model/tỷ lệ/phong cách/thời lượng) nằm TRONG [data-testid="chat_input"].
   model_button: 'button:has-text("Model")'
   model_option: '[role="menuitem"]'
 
-  # --- Reference image upload (image mode only) ---
-  # Nút "Reference Image" — click mở native file chooser (multiple).
+  # --- Tỷ lệ khung hình (image: có mô tả kèm; video: bare) ---
+  ratio_button: 'button:has-text("Tỷ lệ")'
+  # --- Phong cách (image only) ---
+  style_button: 'button:has-text("Phong cách")'
+  # --- Thời lượng video (nút hiển thị giá trị hiện tại: 5s hoặc 10s) ---
+  duration_button: 'button:has-text("5s"), button:has-text("10s")'
+
+  # --- Reference image upload (image + video tab dùng chung 1 nút) ---
+  # Nút "Reference Image" — mở native file chooser (multiple).
   # Upload qua Playwright filechooser event + set_files.
   ref_button: '[data-testid="image-creation-chat-input-picture-reference-button"]'
   ref_max: 10  # server-side limit (ByteDance)
+  # Button text của modal Templates (approach 1 upload) — theo ngôn ngữ UI
+  templates_button_texts: ["Templates", "Mẫu"]
 
   # --- Input ---
-  # Chat thường dùng textarea; image/video skill mode dùng contenteditable TiPTap.
+  # Chat thường dùng textarea; skill mode dùng contenteditable TiPTap.
   chat_textarea:  'textarea[data-testid="chat_input_input"]'
   editor_prose:   'div.tiptap.ProseMirror'
 
@@ -46,11 +66,30 @@ selectors:
   done_indicator: '[data-testid="message_action_bar"]'
   # Ảnh kết quả (src chứa rc_gen_image / ocean-flow / tos-mya)
   result_image: '[data-testid="mdbox_image"] img'
+  # Video kết quả: block video trong bot message. Chứa img.cover (thumbnail);
+  # <video src> CHỈ được tạo khi click vào block (xgplayer lazy-init) -> driver click rồi đọc src.
+  result_video: 'div[class*="block-video"]'
+
+# --- Refusal / content-block patterns ---
+# Cici ĐÃ gen xong nhưng TỪ CHỐI hiển thị kết quả (bản quyền / content policy),
+# vd: "Để bảo vệ bản quyền, tôi không thể hiển thị cho bạn video đã tạo vì âm
+# thanh trong video...". Khi driver thấy pattern này trong bot message → fail
+# nhanh (CONTENT_BLOCKED) thay vì spin tới timeout. Match case-insensitive
+# substring. Thêm pattern khi thấy Cici đổi wording.
+messages:
+  refusal_patterns:
+    - "bảo vệ bản quyền"
+    - "bản quyền"
+    - "to protect copyright"
+    - "copyright"
 
 # --------------------------------------------------------------------------- #
 # Model registry — HARDCODE (Cici không có API list model).
 # `alias` = tên ngắn cho flag --model. `select_text` = text cần click trong dropdown.
-# Khi Cici thêm model mới → cập nhật đây (chạy `python inspect_models.py` để re-check).
+# Verify trên build 147.0.7727.149 (dropdown Model trên trang create-image):
+#   image: Seedream 5.0 Pro / Seedream 4.5
+#   video: Dreamina Seedance 2.5 / 2.0 Nhanh / 1.0 (UI mặc định hiển thị model chọn lần cuối)
+# Khi Cici thêm model mới → cập nhật đây (chạy `python inspect_skills.py` để re-check).
 # --------------------------------------------------------------------------- #
 models:
   image:
@@ -80,14 +119,71 @@ models:
         select_text: "Dreamina Seedance 1.0"
         note: "Video đơn giản."
 
+# --------------------------------------------------------------------------- #
+# Generation options per kind (ratio / style / duration).
+# `alias` = giá trị API/CLI. `select_text` = substring khớp trong menuitem.
+# Image ratios có mô tả kèm trong menu (vd "1:1 (ảnh hồ sơ)") — match bằng alias.
+# Verify trên build 147.0.7727.149.
+# --------------------------------------------------------------------------- #
+options:
+  image:
+    ratios:
+      - { alias: "1:1",  select_text: "1:1" }
+      - { alias: "2:3",  select_text: "2:3" }
+      - { alias: "3:4",  select_text: "3:4" }
+      - { alias: "4:3",  select_text: "4:3" }
+      - { alias: "9:16", select_text: "9:16" }
+      - { alias: "16:9", select_text: "16:9" }
+    styles:
+      - { alias: portrait,          select_text: "Chân dung" }
+      - { alias: landscape,         select_text: "Phong cảnh" }
+      - { alias: anime,             select_text: "Anime" }
+      - { alias: 3d,                select_text: "3D" }
+      - { alias: cyberpunk,         select_text: "cyberpunk" }
+      - { alias: oil-painting,      select_text: "Tranh sơn dầu" }
+      - { alias: watercolor,        select_text: "Màu nước" }
+      - { alias: flat-illustration, select_text: "Minh họa phẳng" }
+      - { alias: children-drawing,  select_text: "Tranh vẽ của trẻ em" }
+      - { alias: pixel,             select_text: "Pixel" }
+      - { alias: colored-pencil,    select_text: "Bút chì màu" }
+      - { alias: ink-wash,          select_text: "Thủy mặc" }
+      - { alias: ink,               select_text: "In mực" }
+  video:
+    ratios:
+      - { alias: "1:1",  select_text: "1:1" }
+      - { alias: "3:4",  select_text: "3:4" }
+      - { alias: "4:3",  select_text: "4:3" }
+      - { alias: "9:16", select_text: "9:16" }
+      - { alias: "16:9", select_text: "16:9" }
+      - { alias: "21:9", select_text: "21:9" }
+    durations:
+      - { alias: "5s",  select_text: "5s" }
+      - { alias: "10s", select_text: "10s" }
+
 timing:
   # Polling interval (s) khi chờ kết quả
   poll_interval: 3
   # Timeout tối đa mỗi job (s). Image ~123s thực tế; video lâu hơn.
   image_timeout: 300
   video_timeout: 600
+  # Hard deadline mỗi job = <kind>_timeout + margin này (s), ép bằng asyncio.wait_for.
+  # Margin chừa cho UI steps (chọn model/ratio/style, upload tới 10 refs, typing).
+  # Vượt deadline → job FAILED + reload UI, queue đi tiếp (bảo vệ single-consumer).
+  hard_deadline_margin: 180
   # Nhỏ giây giữa các thao tác UI (s)
   ui_step_delay: 1.0
+  # Delay sau khi mở dropdown (Model/Tỷ lệ/Phong cách/Thời lượng) trước khi click option
+  dropdown_delay: 0.6
+  # Delay mở modal Templates (reference upload, approach 1)
+  modal_open_delay: 1.5
+  # Delay sau khi set_input_files trong modal
+  modal_upload_delay: 2.0
+  # Delay sau khi đóng modal (Escape)
+  modal_close_delay: 1.0
+  # Delay sau khi click editor trước khi type
+  editor_focus_delay: 0.3
+  # Delay sau khi click tab Hình ảnh/Video trên trang create-image
+  tab_delay: 1.0
 
 concurrency:
   # Worker đơn luồng — Cici chỉ có 1 ô chat, bắt buộc xử lý tuần tự.

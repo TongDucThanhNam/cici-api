@@ -60,16 +60,25 @@ def models(base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
 
 
 def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 10.0,
-             model: str | None = None, references: list[str] | None = None) -> str:
-    """POST /api/generate -> trả job_id ngay (server enqueue, không block).
+             model: str | None = None, references: list[str] | None = None,
+             ratio: str | None = None, style: str | None = None,
+             duration: str | None = None) -> dict:
+    """POST /api/generate -> trả response dict ngay (server enqueue, không block).
 
-    Raise QuotaExhausted (code 429) nếu local estimate báo quota đã cạn.
+    Dict gồm job_id + timeout_s (server-config gen timeout cho kind — CLI dùng
+    thay vì hardcode local). Raise ValueError nếu 422, QuotaExhausted nếu 429.
     """
     payload = {"prompt": prompt, "type": kind}
     if model:
         payload["model"] = model
     if references:
         payload["references"] = references
+    if ratio:
+        payload["ratio"] = ratio
+    if style:
+        payload["style"] = style
+    if duration:
+        payload["duration"] = duration
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{base}/api/generate", json=payload)
     if r.status_code == 422:
@@ -86,7 +95,7 @@ def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 
             detail = {"message": r.text}
         raise QuotaExhausted(detail)
     r.raise_for_status()
-    return r.json()["job_id"]
+    return r.json()
 
 
 class QuotaExhausted(Exception):
@@ -94,6 +103,11 @@ class QuotaExhausted(Exception):
     def __init__(self, detail: dict):
         self.detail = detail
         super().__init__(detail.get("message", "quota exhausted"))
+
+
+# Trạng thái terminal của job — wait_status dừng ngay khi thấy (đủ sớm, đủ
+# đúng): QUOTA_EXHAUSTED/CONTENT_BLOCKED cũng là kết quả cuối, không poll tiếp.
+TERMINAL_STATUSES = ("COMPLETED", "FAILED", "QUOTA_EXHAUSTED", "CONTENT_BLOCKED")
 
 
 def quota(kind: str | None = None, base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
@@ -111,22 +125,55 @@ def wait_status(
     poll_interval: float = 4.0,
     base: str = DEFAULT_BASE,
     on_tick=None,
+    status_fn=None,
 ) -> dict:
     """Poll status tới khi COMPLETED/FAILED hoặc hết timeout.
 
+    Queue-aware: thời gian đứng ở PENDING (chờ hàng đợi) KHÔNG tính vào
+    `timeout` — chỉ thời gian PROCESSING bị giới hạn bởi `timeout`. Tránh
+    tình huống nhiều agent gọi đồng thời: job xếp sau bị TIMEOUT oan dù server
+    vẫn đang xử lý. Tổng thời gian chờ PENDING bị giới hạn bởi
+    `timeout * (queue_ahead ban đầu + 1)` để không treo vô hạn khi server
+    không bao giờ xử lý job.
+
     on_tick(status_dict) — callback mỗi lần poll (cho CLI in progress).
-    Trả về dict status cuối cùng. Nếu timeout -> raise TimeoutError.
+    status_fn — injectable cho test (mặc định gọi status() qua HTTP).
+
+    Dừng ngay khi job đạt trạng thái terminal: COMPLETED / FAILED /
+    QUOTA_EXHAUSTED / CONTENT_BLOCKED (2 trạng thái sau là kết quả cuối —
+    trả về ngay để CLI báo đúng exit code 4/1 thay vì chờ hết timeout).
     """
-    deadline = time.time() + timeout
-    last: dict = {}
-    while time.time() < deadline:
-        last = status(job_id, base=base)
+    fn = status_fn or (lambda jid: status(jid, base=base))
+    first = fn(job_id)
+    if on_tick:
+        on_tick(first)
+    if first.get("status") in TERMINAL_STATUSES:
+        return first
+    queue_ahead = first.get("queue_ahead", 0) or 0
+    pending_cap = time.time() + timeout * (queue_ahead + 1)
+    processing_start: float | None = None
+    last: dict = first
+    while True:
+        now = time.time()
+        if now > pending_cap:
+            raise TimeoutError(
+                f"job {job_id} chưa bắt đầu xử lý sau khi chờ queue "
+                f"(ahead={queue_ahead}; cuối: {last.get('status')})"
+            )
+        last = fn(job_id)
         if on_tick:
             on_tick(last)
-        if last.get("status") in ("COMPLETED", "FAILED"):
+        st = last.get("status")
+        if st in TERMINAL_STATUSES:
             return last
+        if st == "PROCESSING" and processing_start is None:
+            processing_start = now
+        if processing_start is not None and now - processing_start > timeout:
+            raise TimeoutError(
+                f"job {job_id} chưa xong sau {timeout:.0f}s PROCESSING "
+                f"(cuối: {last.get('status')})"
+            )
         time.sleep(poll_interval)
-    raise TimeoutError(f"job {job_id} chưa xong sau {timeout:.0f}s (cuối: {last.get('status')})")
 
 
 # --------------------------------------------------------------------------- #

@@ -2,7 +2,7 @@
 
 Bọc app **Cici / Dola Browser** (ByteDance) thành một REST API để gen **ảnh / video** qua code — tận dụng quota free của account đã đăng nhập trong app.
 
-Cách hoạt động: Playwright nối vào Cici đang chạy qua **Chrome DevTools Protocol (CDP)**, điều khiển UI như người thật, queue xử lý tuần tự (vì Cici chỉ có 1 ô chat). **Đã test E2E**: gen 1 ảnh ~140 giây, trả về 4 URL.
+Cách hoạt động: Playwright nối vào Cici đang chạy qua **Chrome DevTools Protocol (CDP)**, điều khiển UI như người thật, queue xử lý tuần tự (vì Cici chỉ có 1 ô chat). **Đã test E2E**: gen 1 ảnh ~140 giây, trả về 4 URL. Driver entry chính là trang **"Tác phẩm của AI"** (`/chat/create-image`) — verify trên Dola build Chromium **147.0.7727.149** (build cũ hơn fallback sang skill bar trong conversation).
 
 > ⚠️ Lưu ý: đây là automation UI, không phải API chính chủ. Nó vi phạm tinh thần ToS của Cici, brittle khi UI đổi, và bị giới hạn bởi quota tài khoản. Để chạy production nên dùng [Volcengine Doubao API](https://www.volcengine.com/product/doubao) thay thế.
 
@@ -60,6 +60,11 @@ pip install -e .                   # cài package cici-cli (lệnh `cici`)
 ```
 Đã test với Python 3.14, Playwright 1.61, FastAPI 0.141.
 
+> **Lưu ý packaging:** wheel `cici-cli` chỉ chứa CLI client. Core server
+> (`main.py`, `cici_driver.py`, `config.yaml`) chạy trực tiếp từ thư mục repo
+> này — auto-launch của CLI spawn server từ đây, nên **giữ nguyên thư mục
+> repo** (đừng xoá sau khi `pip install -e .`).
+
 ---
 
 ## Chạy
@@ -109,11 +114,30 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 ```
 → `{"job_id":"...", "status":"PENDING"}` (HTTP 202)
 
+Payload đầy đủ (tất cả field ngoài `prompt` đều optional):
+```json
+{
+  "prompt": "…",
+  "type": "image | video",
+  "model": "seedream-4.5",
+  "references": ["C:/path/a.png", "C:/path/b.png"],
+  "ratio": "16:9",
+  "style": "watercolor",       // image only
+  "duration": "5s"             // video only
+}
+```
+- `references` — đường dẫn local, tối đa 10 ảnh. Hỗ trợ cả **video** (image-to-video / frame đầu).
+- `ratio` — alias trong `config.yaml options.<type>.ratios` (image: `1:1, 2:3, 3:4, 4:3, 9:16, 16:9`; video: `1:1, 3:4, 4:3, 9:16, 16:9, 21:9`).
+- `style` — image only (13 phong cách, xem `GET /api/models`).
+- `duration` — video only (`5s` / `10s`).
+
+Giá trị không hợp lệ → `422` kèm danh sách hợp lệ.
+
 **Poll kết quả:**
 ```bash
 curl http://127.0.0.1:8000/api/status/<job_id>
 ```
-Trạng thái: `PENDING → PROCESSING → COMPLETED` (kèm `result_urls[]`) hoặc `FAILED`.
+Trạng thái: `PENDING → PROCESSING → COMPLETED` (kèm `result_urls[]`), `FAILED`, `QUOTA_EXHAUSTED`, hoặc `CONTENT_BLOCKED` (Cici đã gen nhưng từ chối hiển thị — bản quyền / content policy).
 
 **Check sức khỏe:**
 ```bash
@@ -154,19 +178,26 @@ Sau đó **mở terminal mới** (terminal cũ đã cache PATH). Hoặc gọi t�
 cici health
 cici health --json          # JSON cho agent
 
-# Xem các model khả dụng (cho --model)
+# Xem các model + generation options khả dụng (cho --model/--ratio/--style/--duration)
 cici models                 # bảng text
 cici models --type image    # chỉ image
 cici models --json          # JSON cho agent
 
 # Gen ảnh — block tới xong (~30s-3 phút tuỳ model)
 cici image "mèo orange dễ thương, phong cách chibi"
-cici image "..." -m seedream-4.5     # chọn model
+cici image "..." -m seedream-4.5            # chọn model
+cici image "..." --ratio 16:9               # tỷ lệ khung hình
+cici image "..." --style watercolor         # phong cách
+cici image "..." --ref a.png --ref b.png    # ảnh tham chiếu (lặp lại hoặc phân tách dấu phẩy)
 cici image "..." --json     # JSON: {status, job_id, kind, model, elapsed_s, urls:[...]}
 
-# Gen video (LƯU Ý: core chưa detect <video>, có thể timeout)
+# Gen video — block tới xong
 cici video "thuyền buồm trên biển lúc hoàng hôn"
-cici video "..." -m seedance-1.0
+cici video "..." -m seedance-2-fast         # chọn model (nhanh)
+cici video "..." --ratio 9:16               # tỷ lệ khung hình
+cici video "..." --duration 5s              # thời lượng 5s/10s
+cici video "..." --ref a.png                # image-to-video: ảnh = frame đầu
+cici video "..." --json
 
 # Poll trạng thái 1 job (không block)
 cici status <job_id>
@@ -182,7 +213,16 @@ cici status <job_id>
 | video | `seedance-2-fast` | Dreamina Seedance 2.0 Nhanh | nhanh |
 | video | `seedance-1.0` | Dreamina Seedance 1.0 | đơn giản |
 
-Registry nằm trong `config.yaml` (`models:` section). Khi Cici thêm model → chạy `python inspect_dom.py` re-check + cập nhật config.
+**Generation options** (cũng trong `config.yaml`, xem `cici models`):
+
+| Loại | Group | Alias |
+|---|---|---|
+| image | `--ratio` | `1:1, 2:3, 3:4, 4:3, 9:16, 16:9` |
+| image | `--style` | `portrait, landscape, anime, 3d, cyberpunk, oil-painting, watercolor, flat-illustration, children-drawing, pixel, colored-pencil, ink-wash, ink` |
+| video | `--ratio` | `1:1, 3:4, 4:3, 9:16, 16:9, 21:9` |
+| video | `--duration` | `5s, 10s` |
+
+Registry nằm trong `config.yaml` (`models:` + `options:` section). Khi Cici thêm model/option → chạy `python inspect_skills.py` re-check + cập nhật config.
 
 ### Quota tracking
 
@@ -205,8 +245,8 @@ State lưu ở `~/.cici/quota.json`. Xoá file đó để reset.
 |---|---|---|
 | `0` | COMPLETED | gen xong, có URLs |
 | `1` | FAILED | job COMPLETED với lỗi server-side |
-| `2` | TIMEOUT | gen không xong trong timeout (320s ảnh / 620s video) |
-| `3` | PREFLIGHT | core server hoặc Cici chưa chạy → CLI in hướng dẫn khắc phục |
+| `2` | TIMEOUT | gen không xong trong timeout (300s ảnh / 600s video — theo `config.yaml` timing, server trả kèm `timeout_s` trong response 202) — **chỉ tính thời gian PROCESSING**; thời gian chờ hàng đợi (PENDING, nhiều agent gọi đồng thời) tính riêng theo `queue_ahead` |
+| `3` | PREFLIGHT | core server hoặc Cici chưa chạy, **hoặc mất kết nối server giữa chừng** (`POLL_ERROR` — job có thể vẫn đang chạy, kiểm tra lại bằng `cici status <job_id>`) → CLI in hướng dẫn khắc phục |
 | `4` | QUOTA_EXHAUSTED | hết quota hằng ngày — **đừng retry ngay**, chờ reset (rolling 24h) |
 
 ### Agent integration note
@@ -227,8 +267,9 @@ cici --base http://other-host:8000 image "..."
 | Method | Path | Mô tả |
 |---|---|---|
 | `GET`  | `/api/health` | Cici CDP reachable? + queue size |
-| `POST` | `/api/generate` | Enqueue job (`{prompt, type: "image"|"video"}`) → 202 + `job_id` |
-| `GET`  | `/api/status/{job_id}` | Trạng thái + kết quả |
+| `POST` | `/api/generate` | Enqueue job (`{prompt, type, model?, references?, ratio?, style?, duration?}`) → 202 + `job_id` + `timeout_s` (gen timeout server-side cho kind) |
+| `GET`  | `/api/status/{job_id}` | Trạng thái + kết quả + `queue_ahead` (số job đứng trước) + `queue_size` |
+| `GET`  | `/api/models` | Model registry + generation options (ratio/style/duration) |
 | `GET`  | `/api/jobs` | List job gần đây (debug) |
 
 ---
@@ -239,12 +280,19 @@ Toàn bộ selector + timeout nằm trong **`config.yaml`**. Khi Cici đổi UI 
 
 ```yaml
 selectors:
-  skill_image: 'button[data-testid="skill_bar_button_3"]'
-  skill_video: 'button[data-testid="skill_bar_button_17"]'
+  # entry chính (build 147.0.7727.149+): trang "Tác phẩm của AI"
+  creation_tab_image: '[data-testid="creation-skill-switch-tab-image"]'
+  creation_tab_video: '[data-testid="creation-skill-switch-tab-video"]'
+  model_button: 'button:has-text("Model")'
+  ratio_button: 'button:has-text("Tỷ lệ")'
+  style_button: 'button:has-text("Phong cách")'       # image only
+  duration_button: 'button:has-text("5s"), button:has-text("10s")'  # video only
+  ref_button: '[data-testid="image-creation-chat-input-picture-reference-button"]'
   editor_prose: 'div.tiptap.ProseMirror'   # input ở skill mode
   send_button: '[data-testid="chat_input_send_button"]'
   done_indicator: '[data-testid="message_action_bar"]'  # xuất hiện = gen xong
   result_image: '[data-testid="mdbox_image"] img'
+  result_video: 'div[class*="block-video"]'  # video block (click để lazy-init <video>)
 
 timing:
   image_timeout: 300   # giây
@@ -268,7 +316,9 @@ timing:
 
 ## Giới hạn đã biết
 
-- **Video gen chưa test E2E** — selector (`skill_bar_button_17` + `<video>`) đã có sẵn trong config, logic `_wait_result` hiện chỉ bắt ảnh. Để hỗ trợ video, thêm nhánh detect `<video src>` trong `cici_driver._wait_result`.
+- **Content block / bản quyền** — Cici có thể ĐÃ gen xong nhưng **từ chối hiển thị kết quả** (vd video bị chặn "...vì âm thanh trong video..."). Driver detect refusal message → trạng thái `CONTENT_BLOCKED` (CLI exit 1), **fail nhanh thay vì spin tới timeout**. Đây là filter của Cici (không phải lỗi tool) → đổi ảnh tham chiếu / sửa prompt rồi retry (vd thêm `no sound` / `silent` cho video). Patterns nằm ở `config.yaml` → `messages.refusal_patterns`; thêm khi thấy Cici đổi wording.
+- **Video gen** — result detection đã có (video block + click lazy-init `<video>`), nhưng nhánh inline (kết quả hiện ngay trên trang create-image thay vì navigate sang conversation) chưa được quan sát trực tiếp trong một lần gen thật; nếu app đổi hành vi, fallback nhánh này cần re-check qua `python inspect_skills.py`.
+- **Model/ratio/style text là localized** — `select_text` (vd "Phong cách", "Tỷ lệ") theo ngôn ngữ UI; đổi ngôn ngữ Cici = cập nhật config.
 - **Tốc độ** — tuần tự, ~2 phút/job ảnh. Không phù hợp throughput cao.
 - **Quota** — dùng quota free của account Cici; rate-limit / block có thể xảy ra.
 - **Stability** — UI Cici cập nhật = phải re-inspect config.
@@ -285,6 +335,9 @@ cici-api/
 ├── start_cici.bat     # Launcher Cici có CDP (thủ công — CLI cũng tự làm)
 ├── test_e2e.py        # Smoke test raw API
 ├── inspect_dom.py     # (dev) re-inspect DOM chat khi UI đổi
+├── inspect_skills.py  # (dev) re-inspect skill-mode / create-image DOM (không gen)
+├── tests/
+│   └── test_result_detection.py  # deterministic tests cho logic bắt kết quả (không cần Cici)
 ├── pyproject.toml     # CLI package metadata + entry point `cici`
 ├── requirements.txt   # Python deps (core + CLI)
 ├── install.ps1        # One-click installer (Windows)

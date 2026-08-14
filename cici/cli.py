@@ -25,8 +25,9 @@ from . import _launcher
 console = Console(stderr=True)  # human-facing log -> stderr, stdout giữ JSON/URLs sạch cho agent
 out_console = Console()         # stdout (cho URLs / JSON)
 
-# Timeout theo loại (giây) — khớp config.yaml core
-TIMEOUTS = {"image": 320, "video": 620}
+# Timeout fallback (giây) — dùng khi server cũ không trả timeout_s trong 202.
+# Giá trị thật luôn lấy từ server (config.yaml timing), tránh lệch nhau.
+TIMEOUTS = {"image": 300, "video": 600}
 
 
 # --------------------------------------------------------------------------- #
@@ -120,32 +121,17 @@ def _emit_json(obj: dict) -> None:
 
 
 def _render_result(job: dict, elapsed: float) -> None:
-    """In kết quả COMPLETED dạng bảng có màu (human-friendly)."""
+    """In kết quả COMPLETED dạng gọn: 1 dòng/URL, không table (tiết kiệm token)."""
     urls = job.get("result_urls") or []
     kind = job.get("kind", "?")
-    out_console.print()
-    out_console.print(
-        f"[bold green]✓ COMPLETED[/] · {kind} · {elapsed:.1f}s · {len(urls)} kết quả"
-    )
+    out_console.print(f"[bold green]✓ COMPLETED[/] {kind} {elapsed:.1f}s {len(urls)} kết quả")
     if not urls:
         out_console.print("[yellow](không có URL kết quả)[/]")
         return
-    tbl = Table(title="Kết quả", show_lines=False)
-    tbl.add_column("#", style="dim", width=3)
-    tbl.add_column("URL", overflow="fold")
-    tbl.add_column("Hết hạn", style="cyan")
-    for i, u in enumerate(urls, 1):
-        secs = api.seconds_until_expiry(u)
-        if secs is None:
-            exp = "—"
-        else:
-            local = api.expiry_local(u)
-            exp = f"{local:%H:%M:%S} ({secs/3600:.1f}h nữa)"
-            if secs < 3600:
-                exp = f"[bold red]{exp}[/]"
-        tbl.add_row(str(i), u, exp)
-    out_console.print(tbl)
-    # cảnh báo expiry ngắn
+    for u in urls:
+        # soft_wrap: URL dài KHÔNG được gãy dòng — khách copy/download nguyên vẹn
+        out_console.print(u, soft_wrap=True)
+    # cảnh báo expiry ngắn (chỉ khi cần — đừng tốn token cho URL còn hạn dài)
     soon = [u for u in urls if (api.seconds_until_expiry(u) or 1e9) < 3600]
     if soon:
         out_console.print(
@@ -155,7 +141,9 @@ def _render_result(job: dict, elapsed: float) -> None:
 
 def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                     model: str | None = None, auto_launch: bool = True,
-                    references: list[str] | None = None) -> int:
+                    references: list[str] | None = None,
+                    ratio: str | None = None, style: str | None = None,
+                    duration: str | None = None) -> int:
     """Luồng chung cho image/video: preflight -> generate -> wait -> render."""
     if not _preflight(base, auto_launch=auto_launch):
         return api.EXIT_PREFLIGHT
@@ -164,7 +152,8 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
     t0 = time.time()
 
     try:
-        job_id = api.generate(prompt, kind, base=base, model=model, references=references)
+        resp = api.generate(prompt, kind, base=base, model=model, references=references,
+                            ratio=ratio, style=style, duration=duration)
     except api.QuotaExhausted as e:
         # server refuse vì local quota estimate = 0 (đừng lãng phí thời gian gen)
         if as_json:
@@ -186,6 +175,10 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
     except Exception as e:  # noqa: BLE001
         out_console.print(f"[red]Lỗi khi enqueue job: {e}[/]")
         return api.EXIT_FAILED
+
+    job_id = resp["job_id"]
+    # server trả timeout thật (theo config.yaml timing) — dùng thay vì fallback
+    timeout = float(resp.get("timeout_s") or TIMEOUTS[kind])
 
     if as_json:
         # JSON mode: in progress tối thiểu ra stderr, kết quả JSON ra stdout ở cuối
@@ -214,6 +207,22 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
         else:
             out_console.print(f"[bold red]✗ TIMEOUT: {e}[/]")
         return api.EXIT_TIMEOUT
+    except Exception as e:  # noqa: BLE001 — mất kết nối server giữa chừng poll
+        # Job có thể vẫn đang chạy server-side — agent nên poll lại bằng `status`.
+        if as_json:
+            _emit_json({
+                "status": "POLL_ERROR",
+                "job_id": job_id,
+                "error": str(e),
+                "hint": f"server mất kết nối khi đang poll — chạy `cici status {job_id}` khi server trở lại",
+            })
+        else:
+            out_console.print(
+                f"[bold red]✗ Mất kết nối server khi đang poll job {job_id}[/]\n"
+                f"[dim]{e}[/]\n"
+                f"Job có thể vẫn đang chạy. Khi server trở lại: [bold]cici status {job_id}[/]"
+            )
+        return api.EXIT_PREFLIGHT
 
     elapsed = time.time() - t0
     status = job.get("status")
@@ -238,6 +247,30 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                 )
             )
         return api.EXIT_QUOTA
+
+    if status == "CONTENT_BLOCKED":
+        # Cici ĐÃ gen xong nhưng từ chối hiển thị kết quả (bản quyền / content policy).
+        # Filter của Cici — không phải lỗi tool. Đổi nội dung tham chiếu / prompt rồi retry.
+        if as_json:
+            _emit_json({
+                "status": "CONTENT_BLOCKED",
+                "job_id": job_id,
+                "kind": kind,
+                "message": job.get("message"),
+            })
+        else:
+            out_console.print(
+                Panel.fit(
+                    f"[bold red]Cici từ chối kết quả (bản quyền / content policy)[/]\n"
+                    f"[dim]{(job.get('message') or '')[:240]}[/]\n\n"
+                    "[bold]Cách khắc phục:[/]\n"
+                    "  • Đổi ảnh tham chiếu khác, hoặc sửa prompt.\n"
+                    "  • Với video dính \"âm thanh\": thử thêm 'no sound' / 'silent' / 'ambient only'.\n"
+                    "  Đây là filter của Cici, không phải lỗi tool.",
+                    title="[red]Content blocked", border_style="red",
+                )
+            )
+        return api.EXIT_FAILED
 
     if status == "COMPLETED":
         if as_json:
@@ -329,14 +362,19 @@ def health(ctx: click.Context, as_json: bool):
 @click.option("-m", "--model", default=None, help="Model alias (xem `cici models`).")
 @click.option("--ref", "refs", multiple=True,
               help="Ảnh tham chiếu (đường dẫn local). Lặp lại được, hoặc dùng dấu phẩy: --ref a.png,b.png. Tối đa 10.")
+@click.option("--ratio", default=None,
+              help="Tỷ lệ khung hình (xem `cici models`): 1:1, 2:3, 3:4, 4:3, 9:16, 16:9.")
+@click.option("--style", default=None,
+              help="Phong cách (xem `cici models`): portrait, landscape, anime, 3d, cyberpunk, oil-painting, watercolor, ...")
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
 @click.pass_context
 def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, ...],
-          as_json: bool):
+          ratio: str | None, style: str | None, as_json: bool):
     """Sinh ảnh từ PROMPT (block tới xong, ~2-3 phút).
 
     Model mặc định: seedream-5-pro. Đổi bằng -m/--model (xem `cici models`).
     Thêm ảnh tham chiếu bằng --ref (nhiều lần hoặc phân tách bằng dấu phẩy).
+    Chọn tỷ lệ khung hình --ratio và phong cách --style.
     """
     # flatten: mỗi --ref có thể chứa nhiều path comma-separated
     ref_list: list[str] = []
@@ -347,21 +385,37 @@ def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, .
                 ref_list.append(part)
     sys.exit(_run_generation(prompt, "image", as_json, ctx.obj["base"], model=model,
                              auto_launch=ctx.obj["auto_launch"],
-                             references=ref_list or None))
+                             references=ref_list or None,
+                             ratio=ratio, style=style))
 
 
 @main.command()
 @click.argument("prompt")
 @click.option("-m", "--model", default=None, help="Model alias (xem `cici models`).")
+@click.option("--ref", "refs", multiple=True,
+              help="Ảnh tham chiếu / frame đầu (image-to-video, đường dẫn local). Lặp lại được, hoặc dấu phẩy: --ref a.png,b.png. Tối đa 10.")
+@click.option("--ratio", default=None,
+              help="Tỷ lệ khung hình (xem `cici models`): 1:1, 3:4, 4:3, 9:16, 16:9, 21:9.")
+@click.option("--duration", default=None, help="Thời lượng: 5s hoặc 10s.")
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
 @click.pass_context
-def video(ctx: click.Context, prompt: str, model: str | None, as_json: bool):
+def video(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, ...],
+          ratio: str | None, duration: str | None, as_json: bool):
     """Sinh video từ PROMPT (block tới xong).
 
-    Model mặc định: seedance-2.5. LƯU Ý: core chưa detect <video>, có thể timeout.
+    Model mặc định: seedance-2.5. Hỗ trợ image-to-video: truyền ảnh bằng --ref.
+    Chọn tỷ lệ khung hình --ratio và thời lượng --duration (5s/10s).
     """
+    ref_list: list[str] = []
+    for r in refs:
+        for part in r.split(","):
+            part = part.strip()
+            if part:
+                ref_list.append(part)
     sys.exit(_run_generation(prompt, "video", as_json, ctx.obj["base"], model=model,
-                             auto_launch=ctx.obj["auto_launch"]))
+                             auto_launch=ctx.obj["auto_launch"],
+                             references=ref_list or None,
+                             ratio=ratio, duration=duration))
 
 
 @main.command()
@@ -418,7 +472,7 @@ def quota(ctx: click.Context, as_json: bool):
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
 @click.pass_context
 def models(ctx: click.Context, kind: str | None, as_json: bool):
-    """List các model khả dụng (cho --model flag)."""
+    """List các model khả dụng + generation options (ratio/style/duration)."""
     base = ctx.obj["base"]
     try:
         registry = api.models(base=base)
@@ -433,14 +487,18 @@ def models(ctx: click.Context, kind: str | None, as_json: bool):
             )
         sys.exit(api.EXIT_PREFLIGHT)
 
+    # /api/models trả {models: {...}, options: {...}}; chấp nhận shape cũ (chỉ models)
+    mods = registry.get("models", registry)
+    opts = registry.get("options", {})
     if kind:
-        registry = {kind: registry.get(kind, {})}
+        mods = {kind: mods.get(kind, {})}
+        opts = {kind: opts.get(kind, {})}
     if as_json:
-        _emit_json(registry)
+        _emit_json({"models": mods, "options": opts})
         sys.exit(api.EXIT_OK)
 
-    # human table
-    for modality, info in registry.items():
+    # human table: models
+    for modality, info in mods.items():
         if not info:
             continue
         default = info.get("default")
@@ -457,6 +515,19 @@ def models(ctx: click.Context, kind: str | None, as_json: bool):
                 "[green]✓ default[/]" if is_default else "",
                 opt.get("note", ""),
             )
+        out_console.print(tbl)
+        out_console.print()
+
+    # human table: generation options
+    for modality, groups in opts.items():
+        if not groups:
+            continue
+        tbl = Table(title=f"Generation options · {modality}", show_lines=False)
+        tbl.add_column("group", style="cyan")
+        tbl.add_column("aliases", overflow="fold")
+        for group, options in groups.items():
+            aliases = ", ".join(o["alias"] for o in options)
+            tbl.add_row(group, aliases)
         out_console.print(tbl)
         out_console.print()
     sys.exit(api.EXIT_OK)
@@ -492,7 +563,7 @@ def status(ctx: click.Context, job_id: str, as_json: bool):
         out_console.print(f"[{color}]{st}[/] · job {job_id}")
         if s.get("result_urls"):
             for u in s["result_urls"]:
-                out_console.print(f"  {u}")
+                out_console.print(f"  {u}", soft_wrap=True)
         if s.get("error"):
             out_console.print(f"[dim]  err: {s['error']}[/]")
     sys.exit(api.EXIT_OK if st == "COMPLETED" else (api.EXIT_FAILED if st == "FAILED" else api.EXIT_OK))
