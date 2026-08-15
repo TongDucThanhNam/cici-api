@@ -1,8 +1,22 @@
-# Cici API Wrapper
+<div align="center">
 
-**Gen ảnh / video qua app Cici (Dola Browser) bằng 1 lệnh — CLI + local API wrapper cho AI coding agents.**
+# 🎨 Cici API Wrapper
+
+**Gen ảnh / video qua app Cici (Dola Browser) bằng 1 lệnh** — CLI + local API server cho AI coding agents.
+
+[![Stars][stars-shield]][stars-url]
+[![Forks][forks-shield]][forks-url]
+[![Issues][issues-shield]][issues-url]
+[![License MIT][license-shield]][license-url]
+<br/>
+[![Python 3.10+][python-shield]][python-url]
+[![FastAPI][fastapi-shield]][fastapi-url]
+[![Playwright][playwright-shield]][playwright-url]
+[![Windows auto-launch][windows-shield]][windows-url]
 
 [Quickstart](#quickstart) · [CLI](#cli-cici) · [Exit codes](#exit-codes) · [HTTP API](#http-api) · [Cấu hình](#cấu-hình) · [Xử lý sự cố](#xử-lý-sự-cố) · [Giới hạn](#giới-hạn-đã-biết) · [Phát triển](#phát-triển)
+
+</div>
 
 > ⚠️ **Đây là UI automation, không phải API chính chủ.** Tool điều khiển app Cici
 > đang đăng nhập của bạn qua CDP. Nó vi phạm tinh thần ToS của Cici, brittle khi
@@ -31,7 +45,7 @@
 # 1. Cài (một lần) — chọn 1 trong 3 cách
 pipx install cici_cli                                    # từ PyPI (khi publish)
 pipx install ./dist/cici_cli-0.3.0-py3-none-any.whl      # từ wheel
-pipx install git+https://github.com/TongDucThanhNam/cici-api.git   # từ git (repo private — cần quyền truy cập)
+pipx install git+https://github.com/TongDucThanhNam/cici-api.git   # từ git
 
 # 2. Cài app Cici (Dola Browser) + đăng nhập account ByteDance — thủ công, 1 lần
 #    https://www.ciciai.com/  (login cần account/mật khẩu của bạn, tool không tự login được)
@@ -66,24 +80,23 @@ pipx install ./dist/cici_cli-0.3.0-py3-none-any.whl
 
 Chưa có pipx? `python -m pip install --user pipx && pipx ensurepath`.
 
-### One-liner (host wheel ở URL riêng)
+### One-liner (host wheel qua GitHub Releases)
 
-Script mẫu: `install-web.ps1` / `install-web.sh` trong repo — set `CICI_WHEEL_URL`
-trỏ tới nơi host wheel rồi deploy, khách chạy:
+Build wheel rồi upload vào GitHub Release của repo (đặt tên asset
+`cici_cli-latest-py3-none-any.whl` để URL mặc định không cần đổi mỗi phiên bản):
 
 ```powershell
 # Windows (PowerShell)
-irm https://<your-host>/cici/install.ps1 | iex
+irm https://raw.githubusercontent.com/TongDucThanhNam/cici-api/master/install-web.ps1 | iex
 ```
 ```bash
 # macOS / Linux
-curl -fsSL https://<your-host>/cici/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/TongDucThanhNam/cici-api/master/install-web.sh | sh
 ```
 
-> 💡 Repo `TongDucThanhNam/cici-api` đang **private** — raw GitHub URLs và
-> release assets sẽ 404 với người ngoài, nên flow này không dùng GitHub được.
-> Muốn cài qua GitHub: publish repo (hoặc host wheel ở nơi công khai) rồi set
-> `CICI_WHEEL_URL`.
+Script mẫu: `install-web.ps1` / `install-web.sh` trong repo — mặc định tải wheel
+từ `https://github.com/TongDucThanhNam/cici-api/releases/latest/download/`,
+override bằng env `CICI_WHEEL_URL` nếu host ở chỗ khác (S3, server riêng, ...).
 
 ### pip thường
 
@@ -421,3 +434,21 @@ cici-api/
 ## License
 
 MIT — xem [LICENSE](LICENSE).
+
+<!-- MARKDOWN LINKS & BADGES -->
+[stars-shield]: https://img.shields.io/github/stars/TongDucThanhNam/cici-api?style=for-the-badge
+[stars-url]: https://github.com/TongDucThanhNam/cici-api/stargazers
+[forks-shield]: https://img.shields.io/github/forks/TongDucThanhNam/cici-api?style=for-the-badge
+[forks-url]: https://github.com/TongDucThanhNam/cici-api/network/members
+[issues-shield]: https://img.shields.io/github/issues/TongDucThanhNam/cici-api?style=for-the-badge
+[issues-url]: https://github.com/TongDucThanhNam/cici-api/issues
+[license-shield]: https://img.shields.io/github/license/TongDucThanhNam/cici-api?style=for-the-badge
+[license-url]: https://github.com/TongDucThanhNam/cici-api/blob/master/LICENSE
+[python-shield]: https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white
+[python-url]: https://www.python.org/
+[fastapi-shield]: https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white
+[fastapi-url]: https://fastapi.tiangolo.com/
+[playwright-shield]: https://img.shields.io/badge/Playwright-2EAD33?style=for-the-badge&logo=playwright&logoColor=white
+[playwright-url]: https://playwright.dev/
+[windows-shield]: https://img.shields.io/badge/Windows%20auto--launch-0078D6?style=for-the-badge&logo=windows&logoColor=white
+[windows-url]: #cài-đặt

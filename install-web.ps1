@@ -1,21 +1,18 @@
 # One-line installer cho cici-cli (Windows) — kiểu Codex CLI.
 #
-# Triển khai: build wheel (`python -m pip wheel . --no-deps -w dist`), host file
-# wheel + script này ở URL công cộng (hoặc private có token), rồi khách chạy:
-#   irm https://<your-host>/cici/install.ps1 | iex
+# Triển khai (GitHub Releases): build wheel (`python -m pip wheel . --no-deps -w dist`),
+# rename thành cici_cli-latest-py3-none-any.whl, upload vào Release của repo:
+#   https://github.com/TongDucThanhNam/cici-api/releases
+# Rồi khách chạy:
+#   irm https://raw.githubusercontent.com/TongDucThanhNam/cici-api/master/install-web.ps1 | iex
 #
-# Lưu ý: repo TongDucThanhNam/cici-api đang PRIVATE — raw GitHub URLs / release
-# assets 404 với người ngoài. Nếu publish repo thì có thể trỏ CICI_WHEEL_URL về
-# https://github.com/TongDucThanhNam/cici-api/releases/latest/download/<wheel>.
-#
-# Trước khi host: đặt biến CICI_WHEEL_URL dưới đây trỏ tới URL wheel thật,
-# hoặc để khách override qua env cùng tên.
+# Host chỗ khác: set env CICI_WHEEL_URL (hoặc sửa dòng mặc định dưới đây).
 param()
 
 $ErrorActionPreference = "Stop"
 
-# URL wheel mặc định — THAY bằng URL bạn host (GitHub Release asset public, S3, ...)
-$env:CICI_WHEEL_URL = if ($env:CICI_WHEEL_URL) { $env:CICI_WHEEL_URL } else { "https://example.com/cici_cli-latest-py3-none-any.whl" }
+# URL wheel mặc định — GitHub Releases của repo (asset cici_cli-latest-py3-none-any.whl)
+$env:CICI_WHEEL_URL = if ($env:CICI_WHEEL_URL) { $env:CICI_WHEEL_URL } else { "https://github.com/TongDucThanhNam/cici-api/releases/latest/download/cici_cli-latest-py3-none-any.whl" }
 
 Write-Host "cici-cli installer (Windows)" -ForegroundColor Cyan
 

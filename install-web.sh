@@ -1,18 +1,16 @@
 #!/usr/bin/env sh
 # One-line installer cho cici-cli (macOS/Linux) — kiểu Codex CLI.
 #
-# Triển khai: build wheel (`python -m pip wheel . --no-deps -w dist`), host file
-# wheel + script này ở URL công cộng, rồi khách chạy:
-#   curl -fsSL https://<your-host>/cici/install.sh | sh
+# Triển khai (GitHub Releases): build wheel (`python -m pip wheel . --no-deps -w dist`),
+# rename thành cici_cli-latest-py3-none-any.whl, upload vào Release của repo:
+#   https://github.com/TongDucThanhNam/cici-api/releases
+# Rồi khách chạy:
+#   curl -fsSL https://raw.githubusercontent.com/TongDucThanhNam/cici-api/master/install-web.sh | sh
 #
-# Lưu ý: repo TongDucThanhNam/cici-api đang PRIVATE — raw GitHub URLs / release
-# assets 404 với người ngoài. Nếu publish repo thì có thể trỏ CICI_WHEEL_URL về
-# https://github.com/TongDucThanhNam/cici-api/releases/latest/download/<wheel>.
-#
-# Trước khi host: thay CICI_WHEEL_URL dưới đây bằng URL wheel thật.
+# Host chỗ khác: set env CICI_WHEEL_URL (hoặc sửa dòng mặc định dưới đây).
 set -e
 
-CICI_WHEEL_URL="${CICI_WHEEL_URL:-https://example.com/cici_cli-latest-py3-none-any.whl}"
+CICI_WHEEL_URL="${CICI_WHEEL_URL:-https://github.com/TongDucThanhNam/cici-api/releases/latest/download/cici_cli-latest-py3-none-any.whl}"
 
 echo "cici-cli installer (macOS/Linux)"
 
