@@ -1,8 +1,13 @@
 #!/usr/bin/env sh
 # One-line installer cho cici-cli (macOS/Linux) — kiểu Codex CLI.
 #
-# Triển khai: host file wheel + script này ở URL công cộng, rồi khách chạy:
+# Triển khai: build wheel (`python -m pip wheel . --no-deps -w dist`), host file
+# wheel + script này ở URL công cộng, rồi khách chạy:
 #   curl -fsSL https://<your-host>/cici/install.sh | sh
+#
+# Lưu ý: repo TongDucThanhNam/cici-api đang PRIVATE — raw GitHub URLs / release
+# assets 404 với người ngoài. Nếu publish repo thì có thể trỏ CICI_WHEEL_URL về
+# https://github.com/TongDucThanhNam/cici-api/releases/latest/download/<wheel>.
 #
 # Trước khi host: thay CICI_WHEEL_URL dưới đây bằng URL wheel thật.
 set -e

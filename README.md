@@ -31,7 +31,7 @@
 # 1. Cài (một lần) — chọn 1 trong 3 cách
 pipx install cici_cli                                    # từ PyPI (khi publish)
 pipx install ./dist/cici_cli-0.3.0-py3-none-any.whl      # từ wheel
-pipx install git+https://github.com/<you>/cici-api.git   # từ git
+pipx install git+https://github.com/TongDucThanhNam/cici-api.git   # từ git (repo private — cần quyền truy cập)
 
 # 2. Cài app Cici (Dola Browser) + đăng nhập account ByteDance — thủ công, 1 lần
 #    https://www.ciciai.com/  (login cần account/mật khẩu của bạn, tool không tự login được)
@@ -66,7 +66,10 @@ pipx install ./dist/cici_cli-0.3.0-py3-none-any.whl
 
 Chưa có pipx? `python -m pip install --user pipx && pipx ensurepath`.
 
-### One-liner (khi bạn host wheel ở URL riêng)
+### One-liner (host wheel ở URL riêng)
+
+Script mẫu: `install-web.ps1` / `install-web.sh` trong repo — set `CICI_WHEEL_URL`
+trỏ tới nơi host wheel rồi deploy, khách chạy:
 
 ```powershell
 # Windows (PowerShell)
@@ -77,8 +80,10 @@ irm https://<your-host>/cici/install.ps1 | iex
 curl -fsSL https://<your-host>/cici/install.sh | sh
 ```
 
-Script mẫu: `install-web.ps1` / `install-web.sh` trong repo — set `CICI_WHEEL_URL`
-trỏ tới nơi host wheel rồi deploy.
+> 💡 Repo `TongDucThanhNam/cici-api` đang **private** — raw GitHub URLs và
+> release assets sẽ 404 với người ngoài, nên flow này không dùng GitHub được.
+> Muốn cài qua GitHub: publish repo (hoặc host wheel ở nơi công khai) rồi set
+> `CICI_WHEEL_URL`.
 
 ### pip thường
 
