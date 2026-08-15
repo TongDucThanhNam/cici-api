@@ -14,16 +14,20 @@ signed-in browser session and must not be exposed to an untrusted network.
 
 | Component | Responsibility |
 | --- | --- |
-| `main.py` | FastAPI schemas and endpoints, in-memory queue/store, worker lifespan |
-| `cici_driver.py` | CDP attachment, Playwright UI workflow, job model/store, single worker |
-| `config.yaml` | CDP settings, selectors, model + option registries, timeouts, concurrency invariant |
+| `cici/server.py` | FastAPI schemas and endpoints, in-memory queue/store, worker lifespan (shim `main.py` re-exports it) |
+| `cici/driver.py` | CDP attachment, Playwright UI workflow, job model/store, single worker (shim `cici_driver.py` re-exports it) |
+| `config.yaml` | CDP settings, selectors, model + option registries, timeouts, concurrency invariant. Shipped as `cici/config.yaml`; installed users edit `~/.cici/config.yaml` (auto-copied on first server boot — resolution order in `cici/_config.py`) |
+| `cici/_config.py` | Config resolution: `CICI_CONFIG` env > repo/cwd > `~/.cici/config.yaml` > packaged |
+| `cici/_persist.py` | Crash-recovery job persistence: best-effort write-through to `~/.cici/jobs.json`, reconcile in-flight jobs to `FAILED` on boot, 7-day retention pruning of terminal jobs |
 | `cici/_client.py` | Synchronous HTTP client, polling, exit-code constants, URL expiry parsing |
-| `cici/cli.py` | Click commands, preflight, progress and JSON/human rendering |
-| `cici/_launcher.py` | Windows Cici discovery/launch and detached API-server launch |
+| `cici/cli.py` | Click commands (incl. `doctor` prerequisites check), preflight, progress and JSON/human rendering |
+| `cici/_launcher.py` | Windows Cici discovery/launch and detached API-server launch (`python -m cici.server`) |
 | `cici/_quota.py` | Local rolling 24-hour usage history and learned limit threshold |
 | `inspect_dom.py` | Read-only DOM probe for a running CDP session |
+| `inspect_result_images.py` | Read-only probe of result-image DOM (preview vs full-size viewer URLs) |
 | `inspect_skills.py` | Semi-read-only probe of image/video skill modes (never sends) |
 | `tests/test_result_detection.py` | Deterministic fixture-DOM tests of the result-polling JS |
+| `tests/stress_test.py` | Full-server stress suite with scriptable fake driver (no Cici, no quota; `~/.cici` state redirected to a temp home) |
 | `test_e2e.py` | Live image-generation smoke script; not a hermetic automated test |
 
 ## Request and job flow
@@ -45,9 +49,16 @@ signed-in browser session and must not be exposed to an untrusted network.
    treats all four as terminal so the CLI reports the right exit code
    immediately instead of polling to timeout.
 
-`JobStore` and the queue are process-local and in memory. A restart loses jobs,
-and multiple server processes do not share state. Do not add multiple Uvicorn
-workers without first replacing these primitives with shared coordination.
+`JobStore` is process-local in memory, but the server wraps it in a
+persistent subclass: every update is written through to `~/.cici/jobs.json`
+(best-effort, fail-open), and on boot finished jobs are restored while any
+PENDING/PROCESSING job is reconciled to `FAILED` with a clear error so agents
+know to retry. The `asyncio.Queue` itself is still in memory — queued jobs do
+not survive a restart — and multiple server processes do not share state. Do
+not add multiple Uvicorn workers without first replacing these primitives with
+shared coordination. Terminal jobs older than 7 days are pruned from the file
+on save (retention); result URLs expire anyway, so the file is not durable
+media storage.
 
 Jobs are enqueued with a monotonically increasing sequence number; the status
 endpoint exposes `queue_ahead` (PENDING jobs enqueued earlier) and `queue_size`
@@ -82,9 +93,11 @@ timing out on jobs that are simply waiting their turn.
 - The local quota estimate must never block generation when its state file is
   corrupt: `QuotaState.from_dict` sanitizes types, `load()` swallows file
   errors, and the `/api/generate` quota pre-check fails open.
-- `config.yaml` is loaded relative to the process working directory when
-  `main.py` is imported. Normal operation therefore starts from the repository
-  root unless configuration loading is deliberately redesigned.
+- Config resolution (`cici/_config.py`): `CICI_CONFIG` env > `./config.yaml`
+  in the CWD (dev workflow) > `~/.cici/config.yaml` (installed users' editable
+  copy, auto-created from the packaged default on first server boot) >
+  packaged `cici/config.yaml`. Keep `cici/config.yaml` in sync with the
+  repo-root file.
 - References are local files (image + video modalities) and capped by
   `selectors.ref_max`.
 - Model aliases and option aliases (`ratio`/`style`/`duration`) are part of the
@@ -99,8 +112,9 @@ timing out on jobs that are simply waiting their turn.
 
 | Change | Primary files | Also review |
 | --- | --- | --- |
-| Endpoint/schema/job state | `main.py` | `cici/_client.py`, `cici/cli.py`, `README.md` |
-| Browser workflow/result detection | `cici_driver.py` | `config.yaml`, `docs/ui-automation.md` |
+| Endpoint/schema/job state | `cici/server.py` | `cici/_client.py`, `cici/cli.py`, `README.md` |
+| Job persistence/retention | `cici/_persist.py` | Boot-restore logic in `cici/server.py`, `tests/test_persist.py` |
+| Browser workflow/result detection | `cici/driver.py` | `config.yaml`, `docs/ui-automation.md` |
 | Selector/model/timing update | `config.yaml` | Driver assumptions, CLI help, `README.md` |
 | CLI command/output/exit behavior | `cici/cli.py` | `cici/_client.py`, agent integration in `README.md` |
 | Auto-launch behavior | `cici/_launcher.py`, launch scripts | platform-specific instructions in `README.md` |

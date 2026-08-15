@@ -1,7 +1,8 @@
 """End-to-end test against the running API server.
-Start the server first:  uvicorn main:app --port 8000
+Start the server first:  python -m cici.server   (legacy: uvicorn main:app --port 8000)
 
 This posts one image job, polls /api/status until done, prints the result URLs.
+LIVE test — consumes account quota.
 """
 import sys
 import time
@@ -36,7 +37,7 @@ def main():
             if s["status"] != last:
                 print(f"  T+{int(time.time()-t0)}s status={s['status']}")
                 last = s["status"]
-            if s["status"] in ("COMPLETED", "FAILED"):
+            if s["status"] in ("COMPLETED", "FAILED", "QUOTA_EXHAUSTED", "CONTENT_BLOCKED"):
                 print("\n=== RESULT ===")
                 print(s)
                 return

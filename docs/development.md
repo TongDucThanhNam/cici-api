@@ -20,10 +20,11 @@ Python environment and, on Windows, may modify the user `PATH`.
 
 ## Local operation
 
-Start the API from the repository root so `config.yaml` resolves correctly:
+Start the API (self-contained; config resolves from the repo root when
+running from the repo, else `~/.cici/config.yaml`):
 
 ```powershell
-python -m uvicorn main:app --host 127.0.0.1 --port 8000
+python -m cici.server          # hoặc: python -m uvicorn cici.server:app --port 8000
 ```
 
 Useful non-generation checks:
@@ -75,14 +76,19 @@ Put UI selectors, model labels/aliases, CDP parameters, and timeouts in
 `config.yaml` unless code must support a genuinely different interaction flow.
 Local overrides and secrets belong in ignored files, not committed defaults.
 
-Dependency ownership is split:
+Dependency ownership:
 
-- `requirements.txt` installs the API, driver, and CLI runtime.
-- `pyproject.toml` declares dependencies needed by the distributable `cici` CLI
-  package.
-- A new `cici/` runtime dependency normally belongs in both files. A server-only
-  dependency belongs in `requirements.txt`. Keep install scripts and README setup
-  instructions consistent with either change.
+- `requirements.txt` and `pyproject.toml` both install the API, driver, and CLI
+  runtime. Since v0.3.0 the wheel is self-contained (server + config ship inside
+  the `cici` package), so `pipx install` alone is enough for end users.
+- A new `cici/` runtime dependency belongs in both files.
+- `cici/config.yaml` must stay byte-identical to the repo-root `config.yaml`
+  (the stress suite checks this) — copy it before building a wheel.
+- Runtime user state lives under `~/.cici/` (`config.yaml`, `quota.json`,
+  `quota-<account>.json`, `jobs.json`, `server.log`). Never commit it. The
+  stress suite redirects this directory into a temp home before importing any
+  `cici` module — keep new module-level state paths under `Path.home() / ".cici"`
+  so they inherit the same isolation.
 
 When behavior changes, update docstrings/comments only where they explain a
 non-obvious invariant. Update `README.md` for public commands, endpoints, payloads,

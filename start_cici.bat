@@ -22,7 +22,8 @@ if not "%CODE%"=="200" goto wait
 
 echo.
 echo [OK] Cici is running with CDP on http://127.0.0.1:9222
-echo      Now start the API:  uvicorn main:app --port 8000
+echo      API server auto-starts on first generation.
+echo      To start it manually:  python -m cici.server
 echo.
 echo Keep this Cici window open. Do NOT close it.
 pause

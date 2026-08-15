@@ -10,6 +10,7 @@ Exit codes (cho AI agent phân biệt):
 from __future__ import annotations
 
 import json as _json
+import logging
 import sys
 import time
 
@@ -20,7 +21,13 @@ from rich.table import Table
 
 from . import __version__
 from . import _client as api
+from . import _config
 from . import _launcher
+from . import _quota
+
+# httpx log mọi request ở INFO — ồn cho CLI; chỉ hiện WARN+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 console = Console(stderr=True)  # human-facing log -> stderr, stdout giữ JSON/URLs sạch cho agent
 out_console = Console()         # stdout (cho URLs / JSON)
@@ -28,6 +35,81 @@ out_console = Console()         # stdout (cho URLs / JSON)
 # Timeout fallback (giây) — dùng khi server cũ không trả timeout_s trong 202.
 # Giá trị thật luôn lấy từ server (config.yaml timing), tránh lệch nhau.
 TIMEOUTS = {"image": 300, "video": 600}
+
+
+def _humanize_eta(seconds: float | int | None) -> str:
+    """Format số giây thành 'Xh Ym' / 'Ym Zs' / 'Zs'. None → '?'."""
+    if seconds is None or seconds < 0:
+        return "?"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+def _quota_hint_lines(quota_info: dict | None) -> list[str]:
+    """Render hint lines cho panel QUOTA_EXHAUSTED từ dict snapshot (image/video).
+
+    Trả list string (rỗng nếu quota_info không có). Lines:
+      - "Còn ~Xh Ym" nếu oldest_unlock_at / reset_in_seconds có
+      - "[daily cap · chờ rolling window]" hoặc "[rate-limit burst · thử lại 5-10 phút]"
+    """
+    if not isinstance(quota_info, dict):
+        return []
+    lines: list[str] = []
+    # ETA tới oldest unlock (= oldest entry rolls out window)
+    eta = quota_info.get("reset_in_seconds")
+    if isinstance(eta, (int, float)) and eta >= 0:
+        lines.append(f"Còn ~{_humanize_eta(eta)} tới khi slot cũ nhất roll ra window.")
+    # Phân loại limit-hit
+    ltype = quota_info.get("last_limit_type")
+    if ltype == "daily":
+        lines.append("[yellow]Kiểu daily cap — chờ rolling window (có thể vài giờ).[/]")
+    elif ltype == "burst":
+        lines.append("[yellow]Kiểu rate-limit burst — thử lại 5-10 phút có thể qua.[/]")
+    return lines
+
+
+def _quota_sleep(delay: float, reason: str, kind: str, attempt: int) -> None:
+    """Ngủ `delay` giây theo chunk 60s — Ctrl+C phản hồi nhanh + tiến độ định kỳ.
+
+    Progress chỉ ra stderr (console) — stdout giữ sạch cho JSON cuối."""
+    console.print(
+        f"[yellow]↻ Quota {kind} bị chặn ({reason}) — chờ {_humanize_eta(delay)} "
+        f"rồi tự re-enqueue (lần {attempt + 1})…[/]"
+    )
+    remaining = delay
+    while remaining > 0:
+        step = min(60.0, remaining)
+        time.sleep(step)
+        remaining -= step
+        if remaining > 0:
+            console.print(f"[dim]  còn {_humanize_eta(remaining)}…[/]")
+
+
+def _quota_wait_then_retry(quota_info: dict | None, kind: str, attempt: int,
+                           deadline: float, qcfg: dict,
+                           unknown_retry: float) -> bool:
+    """Tính + ngủ thời gian chờ quota. Trả True nếu nên re-enqueue tiếp,
+    False nếu vượt --quota-max-wait (caller exit 4 như cũ)."""
+    delay, reason = _quota.plan_retry(
+        quota_info, kind,
+        burst_retry_seconds=float(qcfg.get("burst_retry_seconds", 300.0)),
+        unknown_retry_seconds=unknown_retry,
+        resume_buffer_seconds=float(qcfg.get("resume_buffer_seconds", 15.0)),
+    )
+    if delay is None:
+        delay, reason = unknown_retry, "thiếu dữ kiện ETA"
+    if time.time() + delay > deadline:
+        console.print(
+            f"[yellow]Quota {kind} vẫn cạn — cần chờ {_humanize_eta(delay)} nữa nhưng vượt "
+            f"--quota-max-wait (còn {_humanize_eta(max(0.0, deadline - time.time()))}) → dừng.[/]"
+        )
+        return False
+    _quota_sleep(delay, reason, kind, attempt)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +165,23 @@ def _preflight_auto(base: str) -> bool:
     if h.get("status") != "ok":
         out_console.print(f"[red]✗ Cici CDP không nối được: {h}[/]")
         return False
+    # 5. Peek quota — nếu đã cạn, in hint với ETA để user biết trước khi enqueue
+    # (vẫn cho phép tiếp tục — không block; chỉ thông báo).
+    try:
+        snap = api.quota(base=base, timeout=2.0)
+        for kind, info in snap.items():
+            rmn = info.get("remaining")
+            if rmn is not None and rmn == 0:
+                hints = _quota_hint_lines(info)
+                hint_block = "\n".join(hints)
+                tail = f"\n{hint_block}" if hint_block else ""
+                console.print(
+                    f"[yellow]⚠ Quota {kind} local estimate = 0 — job sẽ bị 429.[/]"
+                    f"{tail}"
+                )
+                break
+    except Exception:  # noqa: BLE001 — quota peek là best-effort, không bao giờ chặn preflight
+        pass
     return True
 
 
@@ -97,7 +196,7 @@ def _preflight_manual(base: str) -> bool:
                 f"endpoint: {base}\nlỗi: {e}\n\n"
                 "[bold]Cách khắc phục:[/]\n"
                 "  1. Khởi động Cici có CDP: start_cici.bat\n"
-                "  2. Khởi động server: uvicorn main:app --port 8000\n"
+                "  2. Khởi động server: python -m cici.server\n"
                 "  3. Chạy lại. (Hoặc bỏ --no-auto-launch để CLI tự khởi động.)",
                 title="[red]Preflight failed", border_style="red",
             )
@@ -143,50 +242,139 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                     model: str | None = None, auto_launch: bool = True,
                     references: list[str] | None = None,
                     ratio: str | None = None, style: str | None = None,
-                    duration: str | None = None) -> int:
-    """Luồng chung cho image/video: preflight -> generate -> wait -> render."""
+                    duration: str | None = None,
+                    quota_wait: bool = False, quota_max_wait: float | None = None,
+                    account: str | None = None) -> int:
+    """Luồng chung cho image/video: preflight -> generate -> wait -> render.
+
+    quota_wait=True: khi bị quota chặn (429 lúc enqueue hoặc QUOTA_EXHAUSTED
+    giữa job), thay vì exit 4 ngay thì chờ tới khi slot cũ nhất roll ra rolling
+    window (daily cap) hoặc vài phút (burst), rồi tự re-enqueue. Bounded bởi
+    --quota-max-wait + quota.max_attempts — vượt giới hạn thì exit 4 như cũ.
+    """
     if not _preflight(base, auto_launch=auto_launch):
         return api.EXIT_PREFLIGHT
+
+    if quota_wait:
+        try:
+            qcfg = _config.load_config().get("quota") or {}
+        except Exception:  # noqa: BLE001 — config hỏng thì dùng default, không chặn gen
+            qcfg = {}
+    else:
+        qcfg = {}
+    max_attempts = max(1, int(qcfg.get("max_attempts", 3))) if quota_wait else 1
+    if quota_max_wait is None:
+        quota_max_wait = float(qcfg.get("max_wait_seconds", 21600.0))
+    deadline = time.time() + quota_max_wait
+    unknown_retry = float(qcfg.get("unknown_retry_seconds", 120.0))
 
     timeout = TIMEOUTS[kind]
     t0 = time.time()
 
-    try:
-        resp = api.generate(prompt, kind, base=base, model=model, references=references,
-                            ratio=ratio, style=style, duration=duration)
-    except api.QuotaExhausted as e:
-        # server refuse vì local quota estimate = 0 (đừng lãng phí thời gian gen)
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt > 1:
+            console.print(f"[yellow]↻ retry {attempt}/{max_attempts}…[/]")
+
+        try:
+            resp = api.generate(prompt, kind, base=base, model=model, references=references,
+                                ratio=ratio, style=style, duration=duration,
+                                account=account)
+        except api.QuotaExhausted as e:
+            # server refuse vì local quota estimate = 0 (đừng lãng phí thời gian gen)
+            quota_snap = e.detail.get("quota") if isinstance(e.detail, dict) else None
+            hint_lines = _quota_hint_lines(quota_snap if isinstance(quota_snap, dict) else None)
+            if quota_wait and attempt < max_attempts \
+                    and _quota_wait_then_retry(quota_snap, kind, attempt, deadline,
+                                               qcfg, unknown_retry):
+                continue
+            if as_json:
+                _emit_json({
+                    "status": "QUOTA_EXHAUSTED",
+                    "kind": kind,
+                    "detail": e.detail,
+                    "hint": hint_lines,
+                })
+            else:
+                hint_block = "\n".join(hint_lines)
+                out_console.print(
+                    Panel.fit(
+                        f"[bold red]Quota {kind} đã cạn (local estimate)[/]\n"
+                        f"{e.detail.get('message', '') if isinstance(e.detail, dict) else ''}\n\n"
+                        f"{hint_block}\n\n"
+                        "[dim]Chạy `cici quota` xem chi tiết. Agent: đọc "
+                        "detail.quota.suggested_retry_after để schedule lại. "
+                        "Hoặc chạy lại với --wait-for-quota để CLI tự chờ + retry.[/]",
+                        title="[red]Quota exhausted", border_style="red",
+                    )
+                )
+            return api.EXIT_QUOTA
+        except ValueError as e:  # invalid model alias / prompt
+            if as_json:
+                _emit_json({"status": "FAILED", "error": str(e),
+                            "hint": "Chạy `cici models` để xem alias hợp lệ."})
+            else:
+                out_console.print(f"[red]✗ {e}[/]\n[dim]Chạy `cici models` để xem alias hợp lệ.[/]")
+            return api.EXIT_FAILED
+        except Exception as e:  # noqa: BLE001 — server chết / mất kết nối lúc enqueue
+            if as_json:
+                _emit_json({"status": "ENQUEUE_ERROR", "error": str(e),
+                            "hint": "core server không trả lời khi enqueue — thử lại khi server lên lại"})
+            else:
+                out_console.print(f"[red]Lỗi khi enqueue job: {e}[/]")
+            return api.EXIT_PREFLIGHT
+
+        code, job = _wait_job_and_handle(resp, kind, as_json, base, model, timeout, t0)
+        if code is not None:
+            return code
+
+        # QUOTA_EXHAUSTED giữa job — job mang theo snapshot quota để tính thời điểm chờ
+        quota_snap = job.get("quota")
+        hint_lines = _quota_hint_lines(quota_snap if isinstance(quota_snap, dict) else None)
+        if quota_wait and attempt < max_attempts \
+                and _quota_wait_then_retry(quota_snap, kind, attempt, deadline,
+                                           qcfg, unknown_retry):
+            continue
         if as_json:
-            _emit_json({"status": "QUOTA_EXHAUSTED", "kind": kind, "detail": e.detail})
+            _emit_json({
+                "status": "QUOTA_EXHAUSTED",
+                "job_id": resp["job_id"],
+                "kind": kind,
+                "message": job.get("message"),
+                "quota": quota_snap,
+                "hint": hint_lines,
+            })
         else:
+            hint_block = "\n".join(hint_lines)
+            tail = f"\n{hint_block}" if hint_block else ""
             out_console.print(
                 Panel.fit(
-                    f"[bold red]Quota {kind} đã cạn (local estimate)[/]\n"
-                    f"{e.detail.get('message', '')}\n\n"
-                    "[dim]Chạy `cici quota` xem chi tiết. Đừng retry ngay — "
-                    "chờ reset (rolling 24h).[/]",
+                    f"[bold red]Cici báo hết quota {kind}[/]\n"
+                    f"[dim]{job.get('message', '')}[/]\n"
+                    f"{tail}\n\n"
+                    "[dim]Đừng retry ngay — chờ rolling window. Agent: "
+                    "đọc quota.suggested_retry_after. "
+                    "Hoặc chạy lại với --wait-for-quota để CLI tự chờ + retry.[/]",
                     title="[red]Quota exhausted", border_style="red",
                 )
             )
         return api.EXIT_QUOTA
-    except ValueError as e:  # invalid model alias / prompt
-        if as_json:
-            _emit_json({"status": "FAILED", "error": str(e),
-                        "hint": "Chạy `cici models` để xem alias hợp lệ."})
-        else:
-            out_console.print(f"[red]✗ {e}[/]\n[dim]Chạy `cici models` để xem alias hợp lệ.[/]")
-        return api.EXIT_FAILED
-    except Exception as e:  # noqa: BLE001 — server chết / mất kết nối lúc enqueue
-        if as_json:
-            _emit_json({"status": "ENQUEUE_ERROR", "error": str(e),
-                        "hint": "core server không trả lời khi enqueue — thử lại khi server lên lại"})
-        else:
-            out_console.print(f"[red]Lỗi khi enqueue job: {e}[/]")
-        return api.EXIT_PREFLIGHT
 
+
+def _wait_job_and_handle(resp: dict, kind: str, as_json: bool, base: str,
+                         model: str | None, timeout: float,
+                         t0: float) -> tuple[int | None, dict]:
+    """Chờ job tới trạng thái terminal + render kết quả (COMPLETED/FAILED/…).
+
+    Trả (exit_code, job_dict):
+      - QUOTA_EXHAUSTED → (None, job) — caller quyết retry (--wait-for-quota)
+        hay emit + exit 4. Không emit gì ở đây để stdout JSON giữ 1 emit duy nhất.
+      - Các trạng thái khác → (exit_code, {}) sau khi đã emit kết quả cuối.
+    """
     job_id = resp["job_id"]
     # server trả timeout thật (theo config.yaml timing) — dùng thay vì fallback
-    timeout = float(resp.get("timeout_s") or TIMEOUTS[kind])
+    timeout = float(resp.get("timeout_s") or timeout)
 
     if as_json:
         # JSON mode: in progress tối thiểu ra stderr, kết quả JSON ra stdout ở cuối
@@ -214,7 +402,7 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
             _emit_json({"status": "TIMEOUT", "job_id": job_id, "error": str(e)})
         else:
             out_console.print(f"[bold red]✗ TIMEOUT: {e}[/]")
-        return api.EXIT_TIMEOUT
+        return api.EXIT_TIMEOUT, {}
     except Exception as e:  # noqa: BLE001 — mất kết nối server giữa chừng poll
         # Job có thể vẫn đang chạy server-side — agent nên poll lại bằng `status`.
         if as_json:
@@ -230,31 +418,15 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                 f"[dim]{e}[/]\n"
                 f"Job có thể vẫn đang chạy. Khi server trở lại: [bold]cici status {job_id}[/]"
             )
-        return api.EXIT_PREFLIGHT
+        return api.EXIT_PREFLIGHT, {}
 
     elapsed = time.time() - t0
     status = job.get("status")
 
     if status == "QUOTA_EXHAUSTED":
-        # Cici thực sự báo hết quota trong lúc gen
-        if as_json:
-            _emit_json({
-                "status": "QUOTA_EXHAUSTED",
-                "job_id": job_id,
-                "kind": kind,
-                "message": job.get("message"),
-                "quota": job.get("quota"),
-            })
-        else:
-            out_console.print(
-                Panel.fit(
-                    f"[bold red]Cici báo hết quota {kind}[/]\n"
-                    f"[dim]{job.get('message', '')}[/]\n\n"
-                    "Đừng retry ngay — chờ reset (rolling 24h).",
-                    title="[red]Quota exhausted", border_style="red",
-                )
-            )
-        return api.EXIT_QUOTA
+        # Cici thực sự báo hết quota trong lúc gen — snapshot đi kèm để caller
+        # tính thời điểm chờ (daily/burst) nếu chạy với --wait-for-quota.
+        return None, job
 
     if status == "CONTENT_BLOCKED":
         # Cici ĐÃ gen xong nhưng từ chối hiển thị kết quả (bản quyền / content policy).
@@ -278,7 +450,7 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                     title="[red]Content blocked", border_style="red",
                 )
             )
-        return api.EXIT_FAILED
+        return api.EXIT_FAILED, {}
 
     if status == "COMPLETED":
         if as_json:
@@ -301,7 +473,7 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
             _emit_json(payload)
         else:
             _render_result(job, elapsed)
-        return api.EXIT_OK
+        return api.EXIT_OK, {}
 
     # FAILED
     if as_json:
@@ -310,7 +482,7 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
         out_console.print(
             f"[bold red]✗ FAILED[/] · {elapsed:.1f}s\n[dim]{job.get('error')}[/]"
         )
-    return api.EXIT_FAILED
+    return api.EXIT_FAILED, {}
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +538,114 @@ def health(ctx: click.Context, as_json: bool):
 
 
 @main.command()
+@click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
+@click.pass_context
+def doctor(ctx: click.Context, as_json: bool):
+    """Check prerequisites: app Cici, đăng nhập, CDP, server, config.
+
+    Read-only — không tự khởi động/sửa gì. Exit 0 khi sẵn sàng gen,
+    1 khi có mục FAIL (xem hướng dẫn fix trong output).
+    """
+    import sys as _sys
+
+    from . import _config, _launcher
+
+    checks: list[dict] = []
+
+    def add(name: str, status: str, detail: str = "", fix: str = "") -> None:
+        checks.append({"name": name, "status": status, "detail": detail, "fix": fix})
+
+    # 1. Python
+    v = _sys.version_info
+    add("python", "ok" if v >= (3, 10) else "fail",
+        f"{_sys.version.split()[0]} ({_sys.executable})",
+        "" if v >= (3, 10) else "Cài Python >= 3.10.")
+
+    # 2. Package/server importable (deps đầy đủ?)
+    try:
+        import cici.server  # noqa: F401
+        add("cici-server", "ok", "import cici.server OK (fastapi/uvicorn/playwright có sẵn)")
+    except Exception as e:  # noqa: BLE001
+        add("cici-server", "fail", f"import lỗi: {e}",
+            "Cài lại đầy đủ: pip install -r requirements.txt (hoặc pipx reinstall).")
+
+    # 3. Config resolvable
+    try:
+        cfg_path = _config.config_path()
+        _config.load_config(cfg_path)
+        if cfg_path == _config.USER_CONFIG:
+            where = "user (~/.cici)"
+        elif cfg_path == _config.PACKAGED_CONFIG:
+            where = "packaged"
+        else:
+            where = "repo/cwd"
+        add("config", "ok", f"{cfg_path} ({where})")
+    except Exception as e:  # noqa: BLE001
+        add("config", "fail", f"không đọc được config: {e}", "Xem ~/.cici/config.yaml hoặc set CICI_CONFIG.")
+
+    # 4. Cici app installed
+    exe = _launcher._find_cici_exe()
+    if _sys.platform == "win32":
+        add("cici-app", "ok" if exe else "fail",
+            exe or "không tìm thấy Cici.exe",
+            "" if exe else "Cài Cici/Dola Browser, hoặc set env CICI_EXE=<đường dẫn Cici.exe>.")
+    else:
+        add("cici-app", "warn" if not exe else "ok",
+            exe or "không kiểm tra được trên nền tảng này (cần CDP thủ công)",
+            "Chạy Cici với --remote-debugging-port=9222 trước khi gen.")
+
+    # 5. CDP
+    cdp_up = _launcher._cdp_alive()
+    add("cici-cdp", "ok" if cdp_up else "warn",
+        "http://127.0.0.1:9222 up" if cdp_up else "CDP chưa lên (sẽ tự khởi động Cici khi gen)",
+        "" if cdp_up else "Mở Cici có CDP: start_cici.bat — hoặc để CLI tự launch.")
+
+    # 6. Login (chỉ check khi CDP up)
+    if cdp_up:
+        logged_in, detail = _launcher.check_login()
+        add("cici-login", "ok" if logged_in else "fail", detail,
+            "" if logged_in else "Mở cửa sổ Cici, đăng nhập tài khoản ByteDance, rồi chạy lại doctor.")
+    else:
+        add("cici-login", "warn", "chưa check được (CDP xuống)",
+            "Chạy lại doctor sau khi Cici/CDP lên.")
+
+    # 7. Core server
+    api_up = _launcher._api_alive()
+    add("core-server", "ok" if api_up else "warn",
+        "http://127.0.0.1:8000 up" if api_up else "chưa chạy (sẽ tự spawn khi gen)",
+        "" if api_up else "Không cần làm gì — CLI tự spawn. Muốn chạy tay: python -m cici.server")
+
+    # 8. Quota file
+    try:
+        from . import _quota
+        _quota.load()
+        add("quota-state", "ok", f"{_quota.DEFAULT_STATE_PATH}")
+    except Exception as e:  # noqa: BLE001
+        add("quota-state", "warn", f"đọc lỗi: {e} (quota tracking sẽ fail-open)")
+
+    ready = all(c["status"] != "fail" for c in checks)
+    if as_json:
+        _emit_json({"ready": ready, "checks": checks})
+    else:
+        icon = {"ok": "[green]✓[/]", "warn": "[yellow]![/]", "fail": "[red]✗[/]"}
+        tbl = Table(title="cici doctor", show_lines=False)
+        tbl.add_column("", width=3)
+        tbl.add_column("check", style="cyan")
+        tbl.add_column("detail", overflow="fold")
+        for c in checks:
+            tbl.add_row(icon[c["status"]], c["name"], c["detail"])
+        out_console.print(tbl)
+        fails = [c for c in checks if c["status"] == "fail"]
+        if fails:
+            out_console.print("\n[bold red]Cần khắc phục:[/]")
+            for c in fails:
+                out_console.print(f"  • {c['name']}: {c['fix'] or c['detail']}", soft_wrap=True)
+        else:
+            out_console.print("\n[bold green]✓ Sẵn sàng gen[/] (các mục [yellow]![/] là warn, không chặn)")
+    sys.exit(api.EXIT_OK if ready else api.EXIT_FAILED)
+
+
+@main.command()
 @click.argument("prompt")
 @click.option("-m", "--model", default=None, help="Model alias (xem `cici models`).")
 @click.option("--ref", "refs", multiple=True,
@@ -375,9 +655,17 @@ def health(ctx: click.Context, as_json: bool):
 @click.option("--style", default=None,
               help="Phong cách (xem `cici models`): portrait, landscape, anime, 3d, cyberpunk, oil-painting, watercolor, ...")
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
+@click.option("--wait-for-quota", "quota_wait", is_flag=True, default=False,
+              help="Hết quota thì tự chờ slot roll ra rolling 24h rồi re-enqueue (giới hạn bởi --quota-max-wait).")
+@click.option("--quota-max-wait", "quota_max_wait", type=float, default=None,
+              help="Tổng giây chờ quota tối đa khi --wait-for-quota (mặc định từ config quota.max_wait_seconds).")
+@click.option("--account", "account", default=None,
+              help="Nhãn tách quota local theo account (bạn TỰ đổi account trong app Cici — tool không tự đổi).")
 @click.pass_context
 def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, ...],
-          ratio: str | None, style: str | None, as_json: bool):
+          ratio: str | None, style: str | None, as_json: bool,
+          quota_wait: bool, quota_max_wait: float | None,
+          account: str | None):
     """Sinh ảnh từ PROMPT (block tới xong, ~2-3 phút).
 
     Model mặc định: seedream-5-pro. Đổi bằng -m/--model (xem `cici models`).
@@ -394,7 +682,9 @@ def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, .
     sys.exit(_run_generation(prompt, "image", as_json, ctx.obj["base"], model=model,
                              auto_launch=ctx.obj["auto_launch"],
                              references=ref_list or None,
-                             ratio=ratio, style=style))
+                             ratio=ratio, style=style,
+                             quota_wait=quota_wait, quota_max_wait=quota_max_wait,
+                             account=account))
 
 
 @main.command()
@@ -406,9 +696,17 @@ def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, .
               help="Tỷ lệ khung hình (xem `cici models`): 1:1, 3:4, 4:3, 9:16, 16:9, 21:9.")
 @click.option("--duration", default=None, help="Thời lượng: 5s hoặc 10s.")
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
+@click.option("--wait-for-quota", "quota_wait", is_flag=True, default=False,
+              help="Hết quota thì tự chờ slot roll ra rolling 24h rồi re-enqueue (giới hạn bởi --quota-max-wait).")
+@click.option("--quota-max-wait", "quota_max_wait", type=float, default=None,
+              help="Tổng giây chờ quota tối đa khi --wait-for-quota (mặc định từ config quota.max_wait_seconds).")
+@click.option("--account", "account", default=None,
+              help="Nhãn tách quota local theo account (bạn TỰ đổi account trong app Cici — tool không tự đổi).")
 @click.pass_context
 def video(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, ...],
-          ratio: str | None, duration: str | None, as_json: bool):
+          ratio: str | None, duration: str | None, as_json: bool,
+          quota_wait: bool, quota_max_wait: float | None,
+          account: str | None):
     """Sinh video từ PROMPT (block tới xong).
 
     Model mặc định: seedance-2.5. Hỗ trợ image-to-video: truyền ảnh bằng --ref.
@@ -423,17 +721,25 @@ def video(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, .
     sys.exit(_run_generation(prompt, "video", as_json, ctx.obj["base"], model=model,
                              auto_launch=ctx.obj["auto_launch"],
                              references=ref_list or None,
-                             ratio=ratio, duration=duration))
+                             ratio=ratio, duration=duration,
+                             quota_wait=quota_wait, quota_max_wait=quota_max_wait,
+                             account=account))
 
 
 @main.command()
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
+@click.option("--account", "account", default=None,
+              help="Xem quota riêng của 1 nhãn account (state ~/.cici/quota-<nhãn>.json).")
 @click.pass_context
-def quota(ctx: click.Context, as_json: bool):
-    """Xem quota còn lại (rolling 24h local estimate + threshold đã học)."""
+def quota(ctx: click.Context, as_json: bool, account: str | None):
+    """Xem quota còn lại (rolling 24h local estimate + threshold đã học).
+
+    --account <nhãn> để xem quota riêng của nhãn đó. Bạn tự đổi account trong
+    app Cici và gán nhãn khi gen — tool KHÔNG tự đổi account.
+    """
     base = ctx.obj["base"]
     try:
-        snap = api.quota(base=base)
+        snap = api.quota(base=base, account=account)
     except api.CiciUnreachable as e:
         if as_json:
             _emit_json({"status": "unreachable", "error": str(e)})
@@ -448,7 +754,7 @@ def quota(ctx: click.Context, as_json: bool):
         sys.exit(api.EXIT_FAILED)
 
     if as_json:
-        _emit_json(snap)
+        _emit_json({"account": account, **snap})
         sys.exit(api.EXIT_OK)
 
     # human render
@@ -458,7 +764,11 @@ def quota(ctx: click.Context, as_json: bool):
         rmn = info.get("remaining")
         window = info.get("window_hours", 24)
         reset = info.get("reset_in_seconds")
-        tbl = Table(title=f"Quota · {kind} (rolling {window}h)", show_lines=False)
+        ltype = info.get("last_limit_type")
+        title = f"Quota · {kind} (rolling {window}h)"
+        if account:
+            title += f" · account {account}"
+        tbl = Table(title=title, show_lines=False)
         tbl.add_column("metric", style="cyan")
         tbl.add_column("value")
         tbl.add_row("used", str(used))
@@ -467,8 +777,13 @@ def quota(ctx: click.Context, as_json: bool):
             color = "green" if rmn > 0 else "red"
             tbl.add_row("remaining", f"[{color}]{rmn}[/{color}]")
         if reset is not None:
-            hrs = reset / 3600
-            tbl.add_row("reset trong", f"{hrs:.1f}h (khi gen cũ nhất roll ra khỏi window)")
+            tbl.add_row("reset trong", f"{_humanize_eta(reset)} (khi gen cũ nhất roll ra khỏi window)")
+        if ltype:
+            label = {
+                "daily": "[yellow]daily cap[/] — chờ rolling window",
+                "burst": "[yellow]rate-limit burst[/] — có thể qua sau vài phút",
+            }.get(ltype, ltype)
+            tbl.add_row("limit type cuối", label)
         out_console.print(tbl)
         out_console.print()
     sys.exit(api.EXIT_OK)
@@ -491,7 +806,7 @@ def models(ctx: click.Context, kind: str | None, as_json: bool):
         else:
             out_console.print(
                 f"[red]✗ Core server không trả lời: {e}[/]\n"
-                "[dim]`cici models` cần core server chạy (uvicorn main:app).[/]"
+                "[dim]`cici models` cần core server chạy (python -m cici.server).[/]"
             )
         sys.exit(api.EXIT_PREFLIGHT)
 

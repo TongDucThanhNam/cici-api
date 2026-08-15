@@ -1,6 +1,6 @@
 # Cici UI automation
 
-Read this guide before changing `cici_driver.py`, CDP/selector/model/timing fields
+Read this guide before changing `cici/driver.py`, CDP/selector/model/timing fields
 in `config.yaml`, `inspect_dom.py`, or launcher behavior.
 
 ## Safety boundary

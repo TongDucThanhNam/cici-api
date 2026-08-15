@@ -1,206 +1,147 @@
 # Cici API Wrapper
 
-Bọc app **Cici / Dola Browser** (ByteDance) thành một REST API để gen **ảnh / video** qua code — tận dụng quota free của account đã đăng nhập trong app.
+**Gen ảnh / video qua app Cici (Dola Browser) bằng 1 lệnh — CLI + local API wrapper cho AI coding agents.**
 
-Cách hoạt động: Playwright nối vào Cici đang chạy qua **Chrome DevTools Protocol (CDP)**, điều khiển UI như người thật, queue xử lý tuần tự (vì Cici chỉ có 1 ô chat). **Đã test E2E**: gen 1 ảnh ~140 giây, trả về 4 URL. Driver entry chính là trang **"Tác phẩm của AI"** (`/chat/create-image`) — verify trên Dola build Chromium **147.0.7727.149** (build cũ hơn fallback sang skill bar trong conversation).
+[Quickstart](#quickstart) · [CLI](#cli-cici) · [Exit codes](#exit-codes) · [HTTP API](#http-api) · [Cấu hình](#cấu-hình) · [Xử lý sự cố](#xử-lý-sự-cố) · [Giới hạn](#giới-hạn-đã-biết) · [Phát triển](#phát-triển)
 
-> ⚠️ Lưu ý: đây là automation UI, không phải API chính chủ. Nó vi phạm tinh thần ToS của Cici, brittle khi UI đổi, và bị giới hạn bởi quota tài khoản. Để chạy production nên dùng [Volcengine Doubao API](https://www.volcengine.com/product/doubao) thay thế.
-
-## Yêu cầu
-
-- **Cici / Dola Browser** đã cài + **đã đăng nhập** account ByteDance của bạn (mỗi người dùng quota account riêng).
-- **Python 3.10+**.
-- Windows (có `start_cici.bat`); macOS/Linux chạy được nếu tự khởi động Cici với flag CDP.
-
-## Quick Start (3 bước)
-
-```bash
-# 1. Cài (một lần)
-git clone <repo-url> cici-api && cd cici-api
-powershell -ExecutionPolicy Bypass -File install.ps1   # Windows
-# bash install.sh                                       # macOS/Linux/Git Bash
-
-# 2. Mở Cici app + đăng nhập account ByteDance của bạn (thủ công, 1 lần)
-#    (nếu Cici chưa mở khi gọi cici, CLI sẽ TỰ khởi động nó có CDP)
-
-# 3. Dùng — chỉ 1 lệnh!
-cici health                                    # check trạng thái
-cici image "mèo orange dễ thương" -m seedream-4.5
-```
-
-> 💡 **Auto-launch**: mặc định CLI tự khởi động Cici (có CDP) + core server ngầm nếu chưa chạy.
-> Bạn chỉ cần mở Cici + login thủ công 1 lần (vì login cần account/mật khẩu của bạn).
-> Tắt auto bằng `--no-auto-launch`.
-
-
+> ⚠️ **Đây là UI automation, không phải API chính chủ.** Tool điều khiển app Cici
+> đang đăng nhập của bạn qua CDP. Nó vi phạm tinh thần ToS của Cici, brittle khi
+> UI đổi, và bị giới hạn bởi quota tài khoản. Để chạy production nghiêm túc, hãy
+> dùng API chính chủ của ByteDance (Volcano Engine Ark / Doubao).
 
 ---
 
-## Kiến trúc
+## Tính năng
 
-```
-Client  ──POST /api/generate──▶  FastAPI  ──▶  asyncio.Queue  ──▶  Worker (1 luồng)
-        ◀──202 + job_id──┘            │                                  │
-                                       │                                  ▼
-Client  ──GET /api/status/{id}──▶  JobStore  ◀── update kết quả ──  Playwright (CDP → Cici)
-```
-
-**Producer/Consumer + Async Polling** — lý do: gen ảnh mất 2–5 phút, không thể block HTTP request. N requests tới cũng xếp hàng, xử lý tuần tự để không giẫm đạp UI.
-
----
-
-## Cài đặt (chi tiết)
-
-Cách nhanh: chạy `install.ps1` (Windows) hoặc `install.sh` (macOS/Linux) — nó tự cài deps + package + thêm `cici` vào PATH.
-
-Cách thủ công:
-```bash
-pip install -r requirements.txt   # deps core + CLI
-pip install -e .                   # cài package cici-cli (lệnh `cici`)
-```
-Đã test với Python 3.14, Playwright 1.61, FastAPI 0.141.
-
-> **Lưu ý packaging:** wheel `cici-cli` chỉ chứa CLI client. Core server
-> (`main.py`, `cici_driver.py`, `config.yaml`) chạy trực tiếp từ thư mục repo
-> này — auto-launch của CLI spawn server từ đây, nên **giữ nguyên thư mục
-> repo** (đừng xoá sau khi `pip install -e .`).
+- **1 lệnh là xong**: `cici image "prompt"` — tự khởi động Cici (có CDP) + server nếu thiếu, block tới khi có kết quả.
+- **Cho AI agent**: `--json` stdout sạch, exit codes chuẩn hoá (0/1/2/3/4), timeout đồng bộ từ server.
+- **Ảnh gốc full-size** — tự nâng từ preview ~288px lên bản gốc (vd 1773×2364) qua image viewer.
+- **Image + Video**: model Seedream/Seedance, ratio, style, duration, ảnh tham chiếu (image-to-video).
+- **Queue an toàn** — single-consumer, N agent gọi đồng thời vẫn xếp hàng đúng, `queue_ahead` minh bạch.
+- **Job persistence** — state ghi xuống `~/.cici/jobs.json`; restart server giữa job thì job in-flight bị đánh FAILED (kèm lỗi rõ ràng) thay vì biến mất, job đã xong vẫn tra cứu được sau restart (retention 7 ngày).
+- **Quota tracking** — đếm rolling 24h local, auto-learn threshold, hết quota thì fail nhanh (exit 4); `--wait-for-quota` tự chờ + retry khi slot roll ra window.
+- **`cici doctor`** — check toàn bộ prerequisites trong 1 lệnh.
+- **Self-contained package** — `pipx install` là chạy được, không cần giữ folder repo.
 
 ---
 
-## Chạy
-
-### 1. Khởi động Cici với CDP
-
-Cách A — chạy script (tự kill + relaunch + chờ port):
-```cmd
-start_cici.bat
-```
-
-Cách B — thủ công:
-```cmd
-:: Tắt Cici trước (tránh instance cũ không có CDP)
-taskkill /F /IM Cici.exe
-
-:: Khởi động với remote debugging + giữ nguyên login session
-"%LOCALAPPDATA%\Cici\Application\app\Cici.exe" ^
-  --remote-debugging-port=9222 ^
-  --user-data-dir="%LOCALAPPDATA%\Cici\User Data"
-```
-
-Verify CDP lên:
-```bash
-curl http://127.0.0.1:9222/json/version
-```
-→ phải trả `200` + `Browser: Chrome/147...`
-
-**Để cửa sổ Cici mở.** Không được tắt.
-
-### 2. Khởi động API server
+## Quickstart
 
 ```bash
-cd cici-api
-uvicorn main:app --host 127.0.0.1 --port 8000
+# 1. Cài (một lần) — chọn 1 trong 3 cách
+pipx install cici_cli                                    # từ PyPI (khi publish)
+pipx install ./dist/cici_cli-0.3.0-py3-none-any.whl      # từ wheel
+pipx install git+https://github.com/<you>/cici-api.git   # từ git
+
+# 2. Cài app Cici (Dola Browser) + đăng nhập account ByteDance — thủ công, 1 lần
+#    https://www.ciciai.com/  (login cần account/mật khẩu của bạn, tool không tự login được)
+
+# 3. Kiểm tra môi trường rồi gen
+cici doctor                              # tất cả phải ✓ (hoặc ! warn)
+cici image "mèo orange dễ thương, phong cách chibi" --json
 ```
 
-Log phải hiện: `Worker ready, waiting for jobs.` — nếu không, worker đang thử reconnect CDP (chờ Cici lên).
-
-### 3. Dùng API
-
-**Gen ảnh:**
-```bash
-curl -X POST http://127.0.0.1:8000/api/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"một con mèo orange dễ thương, phong cách chibi","type":"image"}'
-```
-→ `{"job_id":"...", "status":"PENDING"}` (HTTP 202)
-
-Payload đầy đủ (tất cả field ngoài `prompt` đều optional):
-```json
-{
-  "prompt": "…",
-  "type": "image | video",
-  "model": "seedream-4.5",
-  "references": ["C:/path/a.png", "C:/path/b.png"],
-  "ratio": "16:9",
-  "style": "watercolor",       // image only
-  "duration": "5s"             // video only
-}
-```
-- `references` — đường dẫn local, tối đa 10 ảnh. Hỗ trợ cả **video** (image-to-video / frame đầu).
-- `ratio` — alias trong `config.yaml options.<type>.ratios` (image: `1:1, 2:3, 3:4, 4:3, 9:16, 16:9`; video: `1:1, 3:4, 4:3, 9:16, 16:9, 21:9`).
-- `style` — image only (13 phong cách, xem `GET /api/models`).
-- `duration` — video only (`5s` / `10s`).
-
-Giá trị không hợp lệ → `422` kèm danh sách hợp lệ.
-
-**Poll kết quả:**
-```bash
-curl http://127.0.0.1:8000/api/status/<job_id>
-```
-Trạng thái: `PENDING → PROCESSING → COMPLETED` (kèm `result_urls[]`), `FAILED`, `QUOTA_EXHAUSTED`, hoặc `CONTENT_BLOCKED` (Cici đã gen nhưng từ chối hiển thị — bản quyền / content policy).
-
-**Check sức khỏe:**
-```bash
-curl http://127.0.0.1:8000/api/health
-```
-
-**Test tự động (gen 1 ảnh rồi poll tới xong):**
-```bash
-python test_e2e.py
-```
+> 💡 **Auto-launch**: mặc định CLI tự khởi động Cici (có CDP) + core server ngầm
+> nếu chưa chạy. Bạn chỉ cần mở Cici + login thủ công 1 lần. Tắt bằng
+> `--no-auto-launch` (chỉ check + hướng dẫn).
 
 ---
 
-## CLI (`cici`) — dành cho AI Coding Agents & người
+## Cài đặt
 
-Bên cạnh raw HTTP API, có một **CLI pip package** (`cici-cli`) — thin client gọi core server. Đây là cách **AI coding agents dễ dùng nhất**: gọi 1 lệnh = xong (sync), có `--json` để parse, exit code rõ ràng để agent tự rẽ nhánh.
+### Yêu cầu
 
-### Cài đặt
+| | |
+|---|---|
+| Python | ≥ 3.10 (đã test 3.14) |
+| App Cici | [Dola Browser / Cici](https://www.ciciai.com/) đã cài + đăng nhập |
+| OS | Windows: đầy đủ tính năng (auto-launch Cici + server). macOS/Linux: tự chạy server được, còn Cici phải mở thủ công với `--remote-debugging-port=9222` |
+
+### pipx (khuyến nghị — giống npx: 1 lệnh, env isolate)
 
 ```bash
-cd cici-api
-pip install -e .
+pipx install cici_cli          # PyPI (khi publish)
+pipx install ./dist/cici_cli-0.3.0-py3-none-any.whl
 ```
-→ tạo lệnh `cici`.
 
-**Lỗi `cici not recognized` trong PowerShell?** pip cài `cici.exe` vào user Scripts dir (`%APPDATA%\Python\Python314\Scripts`) vốn không nằm trong PATH. Fix 1 lần (persistent):
+Chưa có pipx? `python -m pip install --user pipx && pipx ensurepath`.
+
+### One-liner (khi bạn host wheel ở URL riêng)
+
 ```powershell
-$s = "$env:APPDATA\Python\Python314\Scripts"
-$p = [Environment]::GetEnvironmentVariable('PATH','User')
-if ($p -notlike "*$s*") { [Environment]::SetEnvironmentVariable('PATH', "$p;$s", 'User') }
+# Windows (PowerShell)
+irm https://<your-host>/cici/install.ps1 | iex
 ```
-Sau đó **mở terminal mới** (terminal cũ đã cache PATH). Hoặc gọi tạm: `%APPDATA%\Python\Python314\Scripts\cici.exe`.
+```bash
+# macOS / Linux
+curl -fsSL https://<your-host>/cici/install.sh | sh
+```
 
-### Dùng
+Script mẫu: `install-web.ps1` / `install-web.sh` trong repo — set `CICI_WHEEL_URL`
+trỏ tới nơi host wheel rồi deploy.
+
+### pip thường
 
 ```bash
-# Check core + Cici đang chạy (chạy trước mọi lệnh gen)
-cici health
-cici health --json          # JSON cho agent
+pip install ./dist/cici_cli-0.3.0-py3-none-any.whl
+```
 
-# Xem các model + generation options khả dụng (cho --model/--ratio/--style/--duration)
-cici models                 # bảng text
-cici models --type image    # chỉ image
-cici models --json          # JSON cho agent
+Từ **v0.3.0** wheel là self-contained: CLI + core server + config mặc định đều
+đóng gói sẵn. Server tự spawn ngầm (`python -m cici.server`) khi gen lần đầu và
+tự copy config ra `~/.cici/config.yaml` để bạn chỉnh.
 
-# Gen ảnh — block tới xong (~30s-3 phút tuỳ model)
+### Dev (chạy từ repo)
+
+```bash
+git clone <repo> && cd cici-api
+pip install -r requirements.txt
+pip install -e .          # lệnh `cici` chạy code trong repo
+```
+
+Trong repo, `main.py` / `cici_driver.py` là shim backward-compat — code thật nằm
+ở `cici/server.py` / `cici/driver.py`. Chạy server tay:
+`python -m cici.server` (hoặc `uvicorn cici.server:app --port 8000`).
+
+---
+
+## CLI (`cici`)
+
+### Tổng quan lệnh
+
+| Lệnh | Chức năng |
+|---|---|
+| `cici image <prompt>` | Gen ảnh (block tới xong, ~30s–3 phút tuỳ model) |
+| `cici video <prompt>` | Gen video (block tới xong) |
+| `cici doctor` | Check prerequisites: Python, deps, config, app Cici, CDP, login, server, quota |
+| `cici health` | Check nhanh server + CDP (không auto-launch) |
+| `cici status <job_id>` | Xem trạng thái 1 job (poll 1 lần, không block) |
+| `cici quota` | Quota còn lại (rolling 24h + threshold đã học) |
+| `cici models` | Model + generation options khả dụng |
+
+Tất cả đều có `--json`. Option chung: `--base <url>` (core server, mặc định
+`http://127.0.0.1:8000` hoặc env `CICI_API`), `--no-auto-launch`.
+
+### Gen ảnh
+
+```bash
 cici image "mèo orange dễ thương, phong cách chibi"
-cici image "..." -m seedream-4.5            # chọn model
-cici image "..." --ratio 16:9               # tỷ lệ khung hình
-cici image "..." --style watercolor         # phong cách
-cici image "..." --ref a.png --ref b.png    # ảnh tham chiếu (lặp lại hoặc phân tách dấu phẩy)
-cici image "..." --json     # JSON: {status, job_id, kind, model, elapsed_s, urls:[...]}
+cici image "..." -m seedream-4.5              # chọn model
+cici image "..." --ratio 16:9                 # tỷ lệ khung hình
+cici image "..." --style watercolor           # phong cách
+cici image "..." --ref a.png --ref b.png      # ảnh tham chiếu (lặp lại, hoặc phẩy: --ref a.png,b.png; tối đa 10)
+cici image "..." --wait-for-quota             # hết quota → tự chờ + retry (xem phần Quota tracking)
+cici image "..." --json                       # stdout JSON cho agent
+```
 
-# Gen video — block tới xong
+### Gen video
+
+```bash
 cici video "thuyền buồm trên biển lúc hoàng hôn"
-cici video "..." -m seedance-2-fast         # chọn model (nhanh)
-cici video "..." --ratio 9:16               # tỷ lệ khung hình
-cici video "..." --duration 5s              # thời lượng 5s/10s
-cici video "..." --ref a.png                # image-to-video: ảnh = frame đầu
-cici video "..." --json
-
-# Poll trạng thái 1 job (không block)
-cici status <job_id>
+cici video "..." -m seedance-2-fast           # model nhanh
+cici video "..." --ratio 9:16
+cici video "..." --duration 5s                # 5s / 10s
+cici video "..." --ref a.png                  # image-to-video: ảnh = frame đầu
+cici video "..." --wait-for-quota             # hết quota → tự chờ + retry (xem phần Quota tracking)
 ```
 
 ### Models
@@ -213,150 +154,265 @@ cici status <job_id>
 | video | `seedance-2-fast` | Dreamina Seedance 2.0 Nhanh | nhanh |
 | video | `seedance-1.0` | Dreamina Seedance 1.0 | đơn giản |
 
-**Generation options** (cũng trong `config.yaml`, xem `cici models`):
+**Generation options** (đầy đủ trong `cici models` / `config.yaml`):
 
-| Loại | Group | Alias |
+| Loại | Flag | Giá trị |
 |---|---|---|
 | image | `--ratio` | `1:1, 2:3, 3:4, 4:3, 9:16, 16:9` |
 | image | `--style` | `portrait, landscape, anime, 3d, cyberpunk, oil-painting, watercolor, flat-illustration, children-drawing, pixel, colored-pencil, ink-wash, ink` |
 | video | `--ratio` | `1:1, 3:4, 4:3, 9:16, 16:9, 21:9` |
 | video | `--duration` | `5s, 10s` |
 
-Registry nằm trong `config.yaml` (`models:` + `options:` section). Khi Cici thêm model/option → chạy `python inspect_skills.py` re-check + cập nhật config.
+Khi Cici thêm model/option mới → chạy `python inspect_skills.py` re-check rồi
+cập nhật `config.yaml` (`models:` + `options:`).
 
 ### Quota tracking
 
-Cici free có giới hạn gen hằng ngày nhưng **không tiết lộ** số còn lại / khi reset. Tool **tự track local**:
+Cici free có giới hạn gen hằng ngày nhưng **không tiết lộ** số còn lại / khi
+reset. Tool tự track local:
 
-- **`cici quota`** — xem số đã dùng (rolling 24h), threshold đã học, còn lại, khi reset
-- **Auto-learn threshold** — khi bạn hit limit lần đầu, tool ghi nhớ "N gen thì hết" → từ đó cảnh báo + **từ chối gen trước khi tốn thời gian chờ fail** (exit 4)
-- **Rolling 24h** — quota window trượt, phản ánh đúng cách ByteDance limit (gen cũ tự drop khỏi count sau 24h)
+- **`cici quota`** — đã dùng (rolling 24h), threshold đã học, còn lại, khi reset.
+- **Auto-learn threshold** — hit limit lần đầu → tool ghi nhớ "N gen thì hết" → từ đó **từ chối gen trước khi tốn thời gian chờ fail** (exit 4).
+- **Rolling 24h** — gen cũ tự drop khỏi count sau 24h, phản ánh cách ByteDance limit.
+- **`--wait-for-quota`** — hết quota (429 lúc enqueue hoặc bị chặn giữa job) thì
+  thay vì exit 4 ngay, CLI tự chờ tới khi slot cũ nhất roll ra rolling window
+  (daily cap) hoặc vài phút (rate-limit burst) rồi re-enqueue cùng prompt.
+  Giới hạn bởi `--quota-max-wait <giây>` (mặc định `quota.max_wait_seconds` = 6h)
+  và `quota.max_attempts` (3 lần) trong `config.yaml` — vượt giới hạn thì vẫn
+  exit 4 như cũ, không treo. Không có `--wait-for-quota` thì `--quota-max-wait`
+  bị bỏ qua.
+- **`--account <nhãn>`** — tách quota local theo nhãn account: bạn TỰ đổi account
+  trong app Cici (logout/login thủ công), rồi gán nhãn khi gen để tool đếm
+  rolling 24h + threshold riêng từng account (state ở `~/.cici/quota-<nhãn>.json`,
+  xem bằng `cici quota --account <nhãn>`). Tool KHÔNG tự đổi account, không đụng
+  login/session — nhãn chỉ là bookkeeping, không tăng quota.
 
-```bash
-cici quota                  # xem cả image + video
-cici quota --json           # JSON cho agent
-```
+State ở `~/.cici/quota.json` (hoặc `~/.cici/quota-<nhãn>.json` khi dùng
+`--account`) — xoá file để reset. Quota là **local estimate**
+(đọc file hỏng thì fail-open, không chặn gen).
 
-State lưu ở `~/.cici/quota.json`. Xoá file đó để reset.
-
-### Exit codes (để AI agent rẽ nhánh)
+### Exit codes
 
 | Code | Ý nghĩa | Khi nào |
 |---|---|---|
 | `0` | COMPLETED | gen xong, có URLs |
-| `1` | FAILED | job COMPLETED với lỗi server-side |
-| `2` | TIMEOUT | gen không xong trong timeout (300s ảnh / 600s video — theo `config.yaml` timing, server trả kèm `timeout_s` trong response 202) — **chỉ tính thời gian PROCESSING**; thời gian chờ hàng đợi (PENDING, nhiều agent gọi đồng thời) tính riêng theo `queue_ahead` |
-| `3` | PREFLIGHT | core server hoặc Cici chưa chạy, **hoặc mất kết nối server giữa chừng** (`POLL_ERROR` — job có thể vẫn đang chạy, kiểm tra lại bằng `cici status <job_id>`) → CLI in hướng dẫn khắc phục |
-| `4` | QUOTA_EXHAUSTED | hết quota hằng ngày — **đừng retry ngay**, chờ reset (rolling 24h) |
+| `1` | FAILED | job lỗi server-side (kể cả `CONTENT_BLOCKED` — xem [Giới hạn](#giới-hạn-đã-biết)) |
+| `2` | TIMEOUT | gen không xong trong timeout (300s ảnh / 600s video — theo `config.yaml`, server trả kèm `timeout_s` trong 202) — **chỉ tính thời gian PROCESSING**; chờ hàng đợi (PENDING) tính riêng theo `queue_ahead` |
+| `3` | PREFLIGHT | server/Cici chưa chạy, **hoặc mất kết nối server giữa chừng** (`POLL_ERROR` — job có thể vẫn đang chạy, kiểm tra `cici status <job_id>`) |
+| `4` | QUOTA_EXHAUSTED | hết quota hằng ngày — **đừng retry ngay**, chờ reset (rolling 24h). Trừ khi chạy với `--wait-for-quota`: CLI tự chờ + retry trong giới hạn rồi mới exit 4 |
 
-### Agent integration note
+### Dành cho AI coding agent
 
-Khi agent gọi `cici image`, lệnh **block ~2-4 phút**. Agent cần set tool timeout cao (≥ 320s) hoặc dùng `cici image --json` và đọc stdout. URL kết quả có `x-expires` (parse sẵn trong `--json` field `expires_local`) — nhưng giá trị thường xa 10 năm nên không lo sớm hết hạn.
-
-**Chất lượng ảnh trả về:** driver tự nâng URL từ preview (~288px, watermark lớn)
-lên **ảnh gốc full-size** (vd 1773×2364) bằng cách mở image viewer của từng ảnh
-(template `image_pre_watermark` trong `config.yaml`). Nếu Cici đổi viewer/tool
-lấy không được, job vẫn COMPLETED với URL preview (fallback) — log ghi rõ
-`Full-size upgrade: N/M`. Ảnh gốc vẫn còn watermark nhỏ "AI generated" ở góc —
-đây là watermark do Cici áp lên chính file gốc, không có bản no-watermark qua
-UI này.
-
-Override core URL (mặc định `http://127.0.0.1:8000`):
-```bash
-cici --base http://other-host:8000 image "..."
-# hoặc:  export CICI_API=http://other-host:8000
-```
-
+- `cici image` **block ~2–4 phút** → set tool timeout cao (≥ 320s).
+- `--json`: kết quả cuối in ra **stdout** (1 JSON duy nhất), progress log ra stderr → đọc pipe stdout là parse được.
+- URL kết quả có `x-expires` (parse sẵn field `expires_local`) — thường xa ~10 năm nên hiếm khi gấp.
+- **Chất lượng ảnh**: driver tự nâng URL từ preview (~288px, watermark lớn) lên **ảnh gốc full-size** (vd 1773×2364) bằng image viewer (template `image_pre_watermark`). Nếu viewer đổi/fail → job vẫn COMPLETED với URL preview (fallback), log ghi `Full-size upgrade: N/M`. Ảnh gốc vẫn còn watermark nhỏ "AI generated" ở góc — do Cici áp lên chính file gốc, không có bản sạch qua UI này.
+- Nhiều agent gọi đồng thời: queue xử lý tuần tự, `PENDING` kéo dài là bình thường (xem `queue_ahead` trong `cici status`).
 
 ---
 
-## Endpoints
+## HTTP API
+
+Core server là FastAPI local (bind `127.0.0.1:8000`, tự spawn khi cần).
 
 | Method | Path | Mô tả |
 |---|---|---|
-| `GET`  | `/api/health` | Cici CDP reachable? + queue size |
-| `POST` | `/api/generate` | Enqueue job (`{prompt, type, model?, references?, ratio?, style?, duration?}`) → 202 + `job_id` + `timeout_s` (gen timeout server-side cho kind) |
-| `GET`  | `/api/status/{job_id}` | Trạng thái + kết quả + `queue_ahead` (số job đứng trước) + `queue_size` |
-| `GET`  | `/api/models` | Model registry + generation options (ratio/style/duration) |
-| `GET`  | `/api/jobs` | List job gần đây (debug) |
+| `GET` | `/api/health` | Cici CDP reachable? + queue size |
+| `POST` | `/api/generate` | Enqueue job → `202` + `job_id` + `timeout_s` |
+| `GET` | `/api/status/{job_id}` | Trạng thái + kết quả + `queue_ahead` + `queue_size` |
+| `GET` | `/api/models` | Model registry + generation options |
+| `GET` | `/api/quota` | Quota snapshot (`?kind=image\|video`, `?account=<nhãn>`) |
+| `GET` | `/api/jobs` | Job gần đây (debug) |
+
+**Gen:**
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"một con mèo orange dễ thương","type":"image"}'
+# → 202 {"job_id":"…","status":"PENDING","timeout_s":300}
+```
+
+Payload đầy đủ (ngoài `prompt` đều optional):
+
+```json
+{
+  "prompt": "…",
+  "type": "image | video",
+  "model": "seedream-4.5",
+  "references": ["C:/path/a.png", "C:/path/b.png"],
+  "ratio": "16:9",
+  "style": "watercolor",
+  "duration": "5s",
+  "account": "nhãn-tuỳ-chọn"
+}
+```
+
+- `references` — đường dẫn local, tối đa 10, hỗ trợ cả **video** (image-to-video).
+- `style` chỉ dùng cho image; `duration` chỉ cho video.
+- `account` — nhãn tuỳ chọn để tách quota local theo account (bạn tự đổi account
+  trong app Cici; tool không tự đổi). Xem phần Quota tracking.
+- Giá trị không hợp lệ → `422` kèm danh sách hợp lệ.
+
+**Poll:**
+
+```bash
+curl http://127.0.0.1:8000/api/status/<job_id>
+```
+
+Trạng thái: `PENDING → PROCESSING → COMPLETED` (kèm `result_urls[]`), `FAILED`,
+`QUOTA_EXHAUSTED`, hoặc `CONTENT_BLOCKED`.
+
+**Smoke test tự động** (gen 1 ảnh thật, tốn quota): `python test_e2e.py`.
+
+---
+
+## Kiến trúc
+
+```
+Client  ──POST /api/generate──▶  FastAPI  ──▶  asyncio.Queue  ──▶  Worker (1 luồng)
+        ◀──202 + job_id + timeout_s──┘            │                    │
+                                                  │                    ▼
+Client  ──GET /api/status/{id}──▶  JobStore  ◀── update ──  Playwright (CDP → Cici)
+```
+
+- **Producer/Consumer + async polling** — gen mất 2–5 phút, không block HTTP. N request → xếp hàng tuần tự (Cici chỉ có 1 ô chat; worker đơn luồng là bất biến).
+- **Race-safe theo snapshot** — driver chụp số bot messages + set media URL trước khi gửi; chỉ tin kết quả xuất hiện sau đó. Kết quả job trước không thể leak vào job sau.
+- **Hai tầng deadline** — gen timeout (`timing.<kind>_timeout`) trong polling + hard deadline (thêm `timing.hard_deadline_margin`) bằng `asyncio.wait_for`: driver treo thì job `FAILED`, queue đi tiếp.
+- **CDP loss có bound** — `_attach()` bỏ cuộc sau `cdp.connect_timeout` (90s) với lỗi rõ ràng thay vì treo vĩnh viễn.
+- **Job persistence** — mọi update job được ghi xuống `~/.cici/jobs.json` (best-effort, file hỏng thì fail-open). Restart server: job đã xong được restore, job đang chờ/dang xử lý bị đánh FAILED với lỗi "server restarted mid-job" — agent retry là xong. Job terminal cũ hơn 7 ngày tự bị prune khỏi file. Queue vẫn in-memory (job chưa xử lý không sống qua restart).
+- **Self-contained package** — server (`cici/server.py`) spawn bằng `python -m cici.server`, không phụ thuộc folder repo.
 
 ---
 
 ## Cấu hình
 
-Toàn bộ selector + timeout nằm trong **`config.yaml`**. Khi Cici đổi UI (đổi class / testid), **chỉ sửa file này** — không đụng code.
+Toàn bộ selector + model registry + timing nằm trong **`config.yaml`**. Khi Cici
+đổi UI (đổi class/testid), **chỉ sửa file này** — không đụng code.
+
+Thứ tự resolve (xem `cici/_config.py`):
+
+1. env `CICI_CONFIG=<đường dẫn>`
+2. `./config.yaml` trong CWD (dev — chạy từ repo)
+3. `~/.cici/config.yaml` — bản user-editable (server tự copy từ default lần đầu)
+4. config đóng gói trong package (fallback)
+
+Trích yếu quan trọng:
 
 ```yaml
 selectors:
-  # entry chính (build 147.0.7727.149+): trang "Tác phẩm của AI"
-  creation_tab_image: '[data-testid="creation-skill-switch-tab-image"]'
-  creation_tab_video: '[data-testid="creation-skill-switch-tab-video"]'
+  creation_tab_image: '[data-testid="creation-skill-switch-tab-image"]'   # build 147.0.7727.149+
   model_button: 'button:has-text("Model")'
   ratio_button: 'button:has-text("Tỷ lệ")'
-  style_button: 'button:has-text("Phong cách")'       # image only
-  duration_button: 'button:has-text("5s"), button:has-text("10s")'  # video only
+  style_button: 'button:has-text("Phong cách")'        # image only
+  duration_button: 'button:has-text("5s"), button:has-text("10s")'   # video only
   ref_button: '[data-testid="image-creation-chat-input-picture-reference-button"]'
-  editor_prose: 'div.tiptap.ProseMirror'   # input ở skill mode
   send_button: '[data-testid="chat_input_send_button"]'
   done_indicator: '[data-testid="message_action_bar"]'  # xuất hiện = gen xong
   result_image: '[data-testid="mdbox_image"] img'
-  result_video: 'div[class*="block-video"]'  # video block (click để lazy-init <video>)
+  result_video: 'div[class*="block-video"]'   # video block (click lazy-init <video>)
+  fullsize_image_marker: "image_pre_watermark"  # template ảnh gốc trong viewer
 
 timing:
-  image_timeout: 300   # giây
+  image_timeout: 300        # giây
   video_timeout: 600
+  hard_deadline_margin: 180 # + timeout = hard deadline mỗi job
 ```
+
+**Environment variables:**
+
+| Biến | Ý nghĩa |
+|---|---|
+| `CICI_API` | Base URL core server (mặc định `http://127.0.0.1:8000`) |
+| `CICI_CONFIG` | Đường dẫn config.yaml override |
+| `CICI_EXE` | Đường dẫn Cici.exe (nếu cài chỗ khác mặc định) |
+| `CICI_USER_DATA` | User-data dir của Cici |
 
 ---
 
-## Cách né "hố bom"
+## Xử lý sự cố
 
-(Đã hiện thực hóa trong `cici_driver.py`)
-
-1. **DOM mutability** — selector tách ra `config.yaml`. Đổi UI → sửa config.
-2. **Zombie state** — mỗi job có timeout; fail thì `page.reload()` clear state, đánh dấu `FAILED`, đi tiếp job kế.
-3. **Concurrency đua UI** — worker **1 luồng** (Cici chỉ có 1 ô chat). Tăng worker = crash.
-4. **Mất kết nối CDP** — `_attach()` tự reconnect với backoff lũy thừa (2s → 30s).
-4. **HTTP timeout** — không block request chờ gen; trả 202 ngay, client poll.
-5. **State mất khi restart server** — `JobStore` in-memory. Production: đổi sang Redis.
+| Triệu chứng | Nguyên nhân & cách xử lý |
+|---|---|
+| `cici not recognized` | pipx/pip Scripts dir chưa có trong PATH. pipx: chạy `pipx ensurepath` rồi mở terminal mới. pip: thêm `%APPDATA%\Python\Python314\Scripts` vào PATH. |
+| `cici doctor` → `cici-cdp` ✗/! | Cici chưa chạy với CDP. Windows: `start_cici.bat` (tự relaunch có CDP) hoặc để CLI tự launch khi gen. |
+| `cici doctor` → `cici-login` ✗ | Mở cửa sổ Cici, đăng nhập account ByteDance, chạy lại doctor. |
+| Job treo / queue không nhúc nhích | Xem log server `~/.cici/server.log`. Hard deadline sẽ tự đánh FAILED job treo (mặc định timeout + 180s) — nếu lặp lại, restart Cici (`start_cici.bat`). |
+| Server restart giữa job | Job đang chờ/xử lý bị đánh FAILED (lỗi "server restarted mid-job") khi server lên lại — enqueue lại là xong. Job đã xong vẫn tra cứu được bằng `cici status` sau restart (lưu 7 ngày trong `~/.cici/jobs.json`). |
+| Đã sửa code/config nhưng hành vi cũ | Lệnh `cici` luôn dùng code mới; **server chạy ngầm giữ code cũ** — kill rồi cho CLI spawn lại: `taskkill /F /PID <pid của cổng 8000>` (tìm bằng `netstat -ano | findstr :8000`). |
+| Cici đổi UI → job FAILED liên tục | Chạy `python inspect_dom.py` / `python inspect_skills.py`, sửa selector trong `~/.cici/config.yaml`. |
+| `429` / exit 4 liên tục | Hết quota rolling 24h — xem `cici quota`, chờ reset. Muốn reset thủ công: xoá `~/.cici/quota.json`. |
 
 ---
 
 ## Giới hạn đã biết
 
-- **Content block / bản quyền** — Cici có thể ĐÃ gen xong nhưng **từ chối hiển thị kết quả** (vd video bị chặn "...vì âm thanh trong video..."). Driver detect refusal message → trạng thái `CONTENT_BLOCKED` (CLI exit 1), **fail nhanh thay vì spin tới timeout**. Đây là filter của Cici (không phải lỗi tool) → đổi ảnh tham chiếu / sửa prompt rồi retry (vd thêm `no sound` / `silent` cho video). Patterns nằm ở `config.yaml` → `messages.refusal_patterns`; thêm khi thấy Cici đổi wording.
-- **Video gen** — result detection đã có (video block + click lazy-init `<video>`), nhưng nhánh inline (kết quả hiện ngay trên trang create-image thay vì navigate sang conversation) chưa được quan sát trực tiếp trong một lần gen thật; nếu app đổi hành vi, fallback nhánh này cần re-check qua `python inspect_skills.py`.
-- **Model/ratio/style text là localized** — `select_text` (vd "Phong cách", "Tỷ lệ") theo ngôn ngữ UI; đổi ngôn ngữ Cici = cập nhật config.
-- **Tốc độ** — tuần tự, ~2 phút/job ảnh. Không phù hợp throughput cao.
-- **Quota** — dùng quota free của account Cici; rate-limit / block có thể xảy ra.
-- **Stability** — UI Cici cập nhật = phải re-inspect config.
+- **Content block / bản quyền** — Cici có thể ĐÃ gen xong nhưng **từ chối hiển thị kết quả** (vd "...vì âm thanh trong video..."). Driver detect refusal → trạng thái `CONTENT_BLOCKED` (exit 1), fail nhanh thay vì spin tới timeout. Đây là filter của Cici (không phải lỗi tool) → đổi ảnh tham chiếu / sửa prompt rồi retry (vd thêm `no sound` / `silent` cho video). Patterns ở `config.yaml` → `messages.refusal_patterns`.
+- **Watermark "AI generated"** — Cici áp lên chính file gốc; không có bản no-watermark qua UI này.
+- **Model/ratio/style text là localized** — `select_text` theo ngôn ngữ UI Cici; đổi ngôn ngữ = cập nhật config.
+- **Tốc độ** — tuần tự ~2 phút/job ảnh; không phù hợp throughput cao.
+- **Quota** — dùng quota free của account Cici; rate-limit / block có thể xảy ra bất cứ lúc nào.
+- **UI Cici cập nhật** = phải re-inspect config (xem [Xử lý sự cố](#xử-lý-sự-cố)).
 
 ---
 
-## File map
+## Phát triển
+
+```bash
+pip install -r requirements.txt && pip install -e .
+python -m cici.server                       # chạy server từ repo
+```
+
+Tests (xuất phát từ repo root, không tốn quota):
+
+```bash
+python -m compileall -q main.py cici_driver.py cici tests   # syntax
+python tests/test_wait_status.py            # queue-aware client polling
+python tests/test_result_detection.py       # result-polling JS trên fixture DOM
+python tests/test_quota.py                  # quota + --wait-for-quota loop (mock)
+python tests/test_accounts.py               # quota theo nhãn account + CLI flag
+python tests/test_persist.py                # job persistence + retention
+python tests/stress_test.py                 # server thật + fake driver: 44 checks
+python test_e2e.py                          # LIVE smoke (tốn quota — chỉ khi cần)
+```
+
+### File map
 
 ```
 cici-api/
-├── main.py            # CORE: FastAPI endpoints + lifespan (start worker)
-├── cici_driver.py     # CORE: Playwright CDP driver + worker loop (consumer)
-├── config.yaml        # CORE: selectors + model registry (sửa khi UI đổi)
-├── start_cici.bat     # Launcher Cici có CDP (thủ công — CLI cũng tự làm)
-├── test_e2e.py        # Smoke test raw API
-├── inspect_dom.py     # (dev) re-inspect DOM chat khi UI đổi
-├── inspect_skills.py  # (dev) re-inspect skill-mode / create-image DOM (không gen)
+├── cici/                      # package (wheel tự chứa: CLI + server + config)
+│   ├── cli.py                 # Click commands: image/video/doctor/health/status/quota/models
+│   ├── server.py              # FastAPI endpoints + queue/store + lifespan (shim: main.py)
+│   ├── driver.py              # Playwright CDP driver + worker loop (shim: cici_driver.py)
+│   ├── _config.py             # config resolution (env > cwd > ~/.cici > packaged)
+│   ├── _client.py             # sync HTTP client + wait_status + URL expiry parser
+│   ├── _launcher.py           # auto-launch Cici + spawn server (python -m cici.server)
+│   ├── _quota.py              # rolling 24h quota tracker + auto-learn threshold
+│   ├── _persist.py            # job persistence (~/.cici/jobs.json) + boot reconcile + retention
+│   └── config.yaml            # config mặc định đóng gói (giữ đồng bộ với bản repo-root)
+├── main.py / cici_driver.py   # shim backward-compat (re-export từ cici/)
+├── config.yaml                # config nguồn (dev) — giữ đồng bộ với cici/config.yaml
 ├── tests/
-│   └── test_result_detection.py  # deterministic tests cho logic bắt kết quả (không cần Cici)
-├── pyproject.toml     # CLI package metadata + entry point `cici`
-├── requirements.txt   # Python deps (core + CLI)
-├── install.ps1        # One-click installer (Windows)
-├── install.sh         # One-click installer (macOS/Linux)
-├── LICENSE            # MIT
-├── cici/              # CLI package (thin HTTP client → core)
-│   ├── __init__.py
-│   ├── _client.py     # httpx client + URL expiry parser
-│   ├── _launcher.py   # auto-launch Cici + spawn server
-│   ├── _quota.py      # rolling 24h quota tracker + auto-learn threshold
-│   └── cli.py         # Click commands: health/image/video/models/quota/status
-└── README.md
+│   ├── test_result_detection.py   # fixture-DOM tests cho poll JS
+│   ├── test_wait_status.py        # queue-aware wait tests
+│   ├── test_quota.py              # quota + --wait-for-quota tests
+│   ├── test_accounts.py           # quota theo nhãn account tests
+│   ├── test_persist.py            # persistence + retention tests
+│   ├── stress_test.py             # stress suite (server thật + fake driver)
+│   └── _cli_entry.py              # entry cho stress chạy CLI trong process thật
+├── test_e2e.py                # LIVE smoke (tốn quota)
+├── inspect_dom.py             # (dev) read-only DOM probe khi UI đổi
+├── inspect_result_images.py   # (dev) probe result-image DOM (preview vs full-size)
+├── inspect_skills.py          # (dev) probe skill/create-image DOM (không gen)
+├── start_cici.bat             # launcher Cici có CDP (thủ công)
+├── install.ps1 / install.sh   # installer repo-local (dev)
+├── install-web.ps1 / install-web.sh   # one-liner installer để host (set CICI_WHEEL_URL)
+├── pyproject.toml / requirements.txt
+└── LICENSE                    # MIT
 ```
 
+---
+
+## License
+
+MIT — xem [LICENSE](LICENSE).

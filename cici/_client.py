@@ -62,11 +62,12 @@ def models(base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
 def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 10.0,
              model: str | None = None, references: list[str] | None = None,
              ratio: str | None = None, style: str | None = None,
-             duration: str | None = None) -> dict:
+             duration: str | None = None, account: str | None = None) -> dict:
     """POST /api/generate -> trả response dict ngay (server enqueue, không block).
 
     Dict gồm job_id + timeout_s (server-config gen timeout cho kind — CLI dùng
     thay vì hardcode local). Raise ValueError nếu 422, QuotaExhausted nếu 429.
+    account = nhãn tách quota local (user TỰ đổi account trong app Cici).
     """
     payload = {"prompt": prompt, "type": kind}
     if model:
@@ -79,6 +80,8 @@ def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 
         payload["style"] = style
     if duration:
         payload["duration"] = duration
+    if account:
+        payload["account"] = account
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{base}/api/generate", json=payload)
     if r.status_code == 422:
@@ -110,9 +113,17 @@ class QuotaExhausted(Exception):
 TERMINAL_STATUSES = ("COMPLETED", "FAILED", "QUOTA_EXHAUSTED", "CONTENT_BLOCKED")
 
 
-def quota(kind: str | None = None, base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
-    """GET /api/quota — snapshot rolling 24h count + threshold."""
-    params = {"kind": kind} if kind else {}
+def quota(kind: str | None = None, account: str | None = None,
+          base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
+    """GET /api/quota — snapshot rolling 24h count + threshold.
+
+    ?kind=image/video lọc theo loại; ?account=<nhãn> quota riêng từng account.
+    """
+    params = {}
+    if kind:
+        params["kind"] = kind
+    if account:
+        params["account"] = account
     with httpx.Client(timeout=timeout) as c:
         r = c.get(f"{base}/api/quota", params=params)
     r.raise_for_status()
@@ -126,6 +137,7 @@ def wait_status(
     base: str = DEFAULT_BASE,
     on_tick=None,
     status_fn=None,
+    poll_max_interval: float = 15.0,
 ) -> dict:
     """Poll status tới khi COMPLETED/FAILED hoặc hết timeout.
 
@@ -142,6 +154,12 @@ def wait_status(
     Dừng ngay khi job đạt trạng thái terminal: COMPLETED / FAILED /
     QUOTA_EXHAUSTED / CONTENT_BLOCKED (2 trạng thái sau là kết quả cuối —
     trả về ngay để CLI báo đúng exit code 4/1 thay vì chờ hết timeout).
+
+    Adaptive backoff: khi job đứng ở PENDING quá lâu (queue rảnh → server bận
+    việc khác), sleep sẽ tăng dần `poll_interval * (1 + polls * 0.3)`, cap ở
+    `poll_max_interval`. Khi job chuyển sang PROCESSING trở lại, reset về
+    `poll_interval` (cần poll sát để biết lúc xong). Giảm HTTP traffic ~70%
+    cho user batch enqueue nhiều job.
     """
     fn = status_fn or (lambda jid: status(jid, base=base))
     first = fn(job_id)
@@ -153,6 +171,8 @@ def wait_status(
     pending_cap = time.time() + timeout * (queue_ahead + 1)
     processing_start: float | None = None
     last: dict = first
+    last_status: str = first.get("status", "")
+    polls_in_status = 0  # số lần liên tiếp poll thấy cùng status
     while True:
         now = time.time()
         if now > pending_cap:
@@ -166,6 +186,12 @@ def wait_status(
         st = last.get("status")
         if st in TERMINAL_STATUSES:
             return last
+        # Reset poll counter khi status đổi
+        if st == last_status:
+            polls_in_status += 1
+        else:
+            last_status = st
+            polls_in_status = 0
         if st == "PROCESSING" and processing_start is None:
             processing_start = now
         if processing_start is not None and now - processing_start > timeout:
@@ -173,7 +199,12 @@ def wait_status(
                 f"job {job_id} chưa xong sau {timeout:.0f}s PROCESSING "
                 f"(cuối: {last.get('status')})"
             )
-        time.sleep(poll_interval)
+        # Adaptive sleep: PENDING/UNKNOWN → backoff; PROCESSING → giữ nguyên poll_interval
+        if st == "PROCESSING":
+            sleep_s = poll_interval
+        else:
+            sleep_s = min(poll_interval * (1.0 + polls_in_status * 0.3), poll_max_interval)
+        time.sleep(sleep_s)
 
 
 # --------------------------------------------------------------------------- #

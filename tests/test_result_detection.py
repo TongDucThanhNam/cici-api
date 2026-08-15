@@ -51,10 +51,10 @@ def bot_msg(imgs=(), videos=(), done=True, text=""):
     )
 
 
-def run_poll(page, before=0, media_before=None):
+def run_poll(page, before=0, media_before=None, kind="image"):
     return page.evaluate(
         _POLL_RESULT_JS,
-        {"sel": SEL, "before": before, "mediaBefore": media_before or []},
+        {"sel": SEL, "before": before, "mediaBefore": media_before or [], "kind": kind},
     )
 
 
@@ -97,7 +97,7 @@ def main() -> int:
             new=bot_msg(videos=[VIDEO1], done=True, text="Video đã tạo"),
         )
         page.set_content(html)
-        res1 = run_poll(page, before=0)
+        res1 = run_poll(page, before=0, kind="video")
         assert res1["videoBlocks"] == 1, res1
         assert res1["urls"] == [], res1  # chưa có <video>, mới chỉ click
         # giả lập xgplayer đã init: inject <video> vào block
@@ -110,7 +110,7 @@ def main() -> int:
             }""",
             VIDEO1,
         )
-        res2 = run_poll(page, before=0)
+        res2 = run_poll(page, before=0, kind="video")
         assert res2["done"] is True, res2
         assert res2["urls"] == [VIDEO1], res2
         passed += 1
@@ -164,7 +164,7 @@ def main() -> int:
             }""",
             VIDEO1,
         )
-        res = run_poll(page, before=0)
+        res = run_poll(page, before=0, kind="video")
         assert res["done"] is True, res
         assert res["urls"] == [VIDEO1], res
         passed += 1

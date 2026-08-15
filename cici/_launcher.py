@@ -105,31 +105,27 @@ def ensure_cici(log=print, cdp_timeout: float = 30.0) -> tuple[bool, str]:
 def ensure_server(log=print, cwd: str | None = None, api_timeout: float = 20.0) -> tuple[bool, str]:
     """Đảm bảo core API server chạy. Trả (ok, message).
 
-    Nếu server up → ok. Nếu chưa → spawn `uvicorn main:app` ngầm trong thư mục repo.
+    Server là module self-contained trong package: spawn `python -m cici.server`
+    (không cần folder repo), log ra ~/.cici/server.log. `cwd` giữ lại cho
+    backward-compat nhưng không còn bắt buộc.
     """
     if _api_alive():
         return True, "Core server đã chạy."
 
     if sys.platform != "win32":
         return False, (
-            "Auto-spawn server chỉ hỗ trợ Windows. Chạy `uvicorn main:app --port 8000` thủ công."
+            "Auto-spawn server chỉ hỗ trợ Windows. Chạy `python -m cici.server` thủ công."
         )
     import subprocess
 
-    # tìm thư mục repo (chứa main.py) — dựa vào vị trí package hoặc cwd
-    repo_dir = cwd or _find_repo_dir()
-    if not repo_dir or not (Path(repo_dir) / "main.py").exists():
-        return False, (
-            "Không tìm thấy main.py của core server. cd vào thư mục cici-api "
-            "hoặc chạy `uvicorn main:app --port 8000` thủ công."
-        )
-    log(f"[dim]Đang khởi động core server trong: {repo_dir}[/]")
-    # redirect output ra file log để không block CLI; detached
-    log_path = Path(repo_dir) / "server.log"
+    log_dir = Path.home() / ".cici"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "server.log"
+    log(f"[dim]Đang khởi động core server (log: {log_path})[/]")
     log_fd = open(log_path, "a", encoding="utf-8")
     subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"],
-        cwd=repo_dir,
+        [sys.executable, "-m", "cici.server", "--host", "127.0.0.1", "--port", "8000"],
+        cwd=cwd,
         stdout=log_fd,
         stderr=subprocess.STDOUT,
         close_fds=True,
@@ -142,17 +138,6 @@ def ensure_server(log=print, cwd: str | None = None, api_timeout: float = 20.0) 
         if _api_alive():
             return True, f"Core server đã khởi động (log: {log_path})."
     return False, f"Core server không lên sau {int(api_timeout)}s. Xem log: {log_path}"
-
-
-def _find_repo_dir() -> str | None:
-    """Tìm thư mục chứa main.py — từ vị trí package đi lên, hoặc cwd."""
-    here = Path(__file__).resolve().parent  # .../cici-api/cici/
-    candidate = here.parent                  # .../cici-api/
-    if (candidate / "main.py").exists():
-        return str(candidate)
-    if (Path.cwd() / "main.py").exists():
-        return str(Path.cwd())
-    return None
 
 
 def check_login(timeout: float = 5.0) -> tuple[bool, str]:

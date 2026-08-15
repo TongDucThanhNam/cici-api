@@ -4,17 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cici-cli"
-version = "0.2.0"
-description = "CLI để gen ảnh/video qua app Cici (Dola Browser) — thin client cho cici-api core."
+version = "0.3.0"
+description = "Gen ảnh/video qua app Cici (Dola Browser) — CLI + local API server tự chứa (UI automation qua CDP)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "terasumi" }]
-keywords = ["cici", "dola", "doubao", "bytedance", "image-generation", "video-generation", "cli"]
+keywords = ["cici", "dola", "bytedance", "image-generation", "video-generation", "cli"]
 dependencies = [
     "httpx>=0.27",
     "click>=8.1",
     "rich>=13.7",
+    # server + driver đi kèm package (self-contained — không cần folder repo)
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "playwright>=1.44",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
@@ -23,3 +28,7 @@ cici = "cici.cli:main"
 
 [tool.setuptools]
 packages = ["cici"]
+
+[tool.setuptools.package-data]
+# config mặc định đi kèm wheel; server tự copy ra ~/.cici/config.yaml lần đầu
+cici = ["config.yaml"]

@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# repo root: main.py load config.yaml theo CWD
+# repo root: server load config.yaml theo CWD (qua cici/_config.py)
 REPO = Path(__file__).resolve().parent.parent
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
@@ -34,6 +34,23 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 import yaml  # noqa: E402
 from click.testing import CliRunner  # noqa: E402
+
+# --------------------------------------------------------------------------- #
+# Isolate user state TRƯỚC KHI import bất kỳ module cici nào.
+#
+# cici/server.py chạy module-level restore từ ~/.cici/jobs.json ngay lúc import,
+# và _PersistentJobStore ghi lại mọi update vào file đó. Không redirect home thì
+# stress suite (a) ghi đè jobs.json THẬT của user bằng job fake, (b) restore job
+# cũ của user vào STORE làm hỏng các guard đếm job (S8a).
+#
+# Path.home() trên Windows đọc USERPROFILE, trên POSIX đọc HOME — set cả hai
+# trước khi import để mọi hằng số module (_persist/_quota/_config) trỏ vào temp.
+# --------------------------------------------------------------------------- #
+import tempfile  # noqa: E402
+
+_STRESS_HOME = Path(tempfile.mkdtemp(prefix="cici-stress-home-"))
+os.environ["USERPROFILE"] = str(_STRESS_HOME)
+os.environ["HOME"] = str(_STRESS_HOME)
 
 import cici_driver  # noqa: E402
 from cici import _client, _quota  # noqa: E402
@@ -162,7 +179,8 @@ class FakeDriver:
         raise AssertionError(f"unknown mode {mode}")
 
 
-cici_driver.CiciDriver = FakeDriver  # noqa: monkeypatch cho cả main lifespan lẫn run_worker
+import cici.driver as _cd
+_cd.CiciDriver = FakeDriver  # noqa: monkeypatch vào module thật (shim chỉ re-export)
 
 
 # --------------------------------------------------------------------------- #
@@ -479,6 +497,10 @@ def s6_contract() -> None:
         check("S6c /api/quota?kind=image chỉ trả image", r.status_code == 200 and "image" in r.json(), "")
         r = c.get("/api/status/00000000-0000-0000-0000-000000000000")
         check("S6d job không tồn tại -> 404", r.status_code == 404, str(r.status_code))
+    root_cfg = (REPO / "config.yaml").read_text(encoding="utf-8")
+    pkg_cfg = (REPO / "cici" / "config.yaml").read_text(encoding="utf-8")
+    check("S6e config.yaml repo == cici/config.yaml (đóng gói) — không lệch",
+          root_cfg == pkg_cfg, "hai bản config khác nhau — copy lại trước khi build wheel")
 
 
 # --------------------------------------------------------------------------- #
@@ -667,9 +689,12 @@ def s7_cli_matrix() -> None:
 # --------------------------------------------------------------------------- #
 def s8_server_death_midpoll() -> None:
     print("\n--- S8: server chết giữa lúc CLI poll kết quả ---")
-    # app fresh trên port riêng để giết không ảnh hưởng server chính
-    spec = importlib.util.find_spec("main")
+    # app fresh trên port riêng để giết không ảnh hưởng server chính.
+    # Load từ FILE cici/server.py — shim main.py chỉ re-export app đã có.
+    # Đăng ký sys.modules TRƯỚC khi exec để Pydantic resolve model được.
+    spec = importlib.util.spec_from_file_location("cici_server_s8", REPO / "cici" / "server.py")
     fresh = importlib.util.module_from_spec(spec)
+    sys.modules["cici_server_s8"] = fresh
     spec.loader.exec_module(fresh)
     fresh.cfg["cdp"]["endpoint"] = MOCK_CDP_URL  # health phải ok để CLI qua preflight
     port2 = free_port()
@@ -694,13 +719,14 @@ def s8_server_death_midpoll() -> None:
              "--base", base2, "image", "s8a midpoll death", "--json"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        # chờ CLI kịp enqueue job của nó (server2 có 2 jobs) rồi +0.5s cho CLI
+        # chờ CLI kịp enqueue job CỦA NÓ (không đếm tổng — jobs.json restore có
+        # thể đã nạp job cũ vào STORE khiến tổng ≥ 2 từ đầu) rồi +0.5s cho CLI
         # bắt đầu poll — tránh race kill trước khi CLI enqueue
         deadline = time.time() + 30
         while time.time() < deadline:
             try:
                 jobs = httpx.get(f"{base2}/api/jobs", timeout=3).json().get("jobs", [])
-                if len(jobs) >= 2:
+                if any("midpoll death" in (j.get("prompt") or "") for j in jobs):
                     break
             except Exception:  # noqa: BLE001
                 break
@@ -754,8 +780,8 @@ def s9_cdp_loss_deadlock() -> None:
     # rebuild class CiciDriver THẬT từ source (module đã bị monkeypatch FakeDriver)
     ns: dict = {}
     try:
-        code = (REPO / "cici_driver.py").read_text(encoding="utf-8")
-        exec(compile(code, "cici_driver.py", "exec"), ns)  # noqa: S102 — đọc chính repo
+        code = (REPO / "cici" / "driver.py").read_text(encoding="utf-8")
+        exec(compile(code, "cici/driver.py", "exec"), ns)  # noqa: S102 — đọc chính repo
         RealDriver = ns["CiciDriver"]
     except Exception as e:  # noqa: BLE001
         check("S9 setup (exec cici_driver source)", False, str(e))
@@ -819,7 +845,7 @@ def s9_cdp_loss_deadlock() -> None:
         store = cici_driver.JobStore()
         await q.put(cici_driver.Job(job_id="j-cdp", kind="image", prompt="x"))
         await q.put(cici_driver.Job(job_id="j-next", kind="image", prompt="y"))
-        task = asyncio.create_task(cici_driver.run_worker(q, store, cfg))
+        task = asyncio.create_task(_cd.run_worker(q, store, cfg))
         s1 = s2 = None
         for _ in range(400):  # tối đa 20s
             await asyncio.sleep(0.05)
@@ -950,6 +976,10 @@ def main() -> int:
                 p.rmdir()
             except OSError:
                 pass
+        # dọn temp home đã redirect ở đầu file (ignore_errors: CLI subprocess
+        # trong S7/S8 có thể còn giữ handle tới log file)
+        import shutil
+        shutil.rmtree(_STRESS_HOME, ignore_errors=True)
 
     print(f"\n{'='*70}")
     print(f"Stress xong trong {time.time()-t0:.1f}s — PASS {PASSES} / FAIL {FAILS} / FINDINGS {len(FINDINGS)}")

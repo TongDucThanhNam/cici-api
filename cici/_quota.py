@@ -94,6 +94,42 @@ class QuotaState:
 
 
 # --------------------------------------------------------------------------- #
+# Account-scoped state (--account) — tách quota theo nhãn, KHÔNG tự đổi account
+# --------------------------------------------------------------------------- #
+def sanitize_account(account: str | None) -> str | None:
+    """Chuẩn hoá label account dùng cho tên file state + truyền qua API.
+
+    None/'' → None (legacy: quota.json chung). Còn lại: trim, giữ chữ-số-_-.,
+    ký tự khác → '_' (chống path traversal / ký tự lạ trên tên file), cap 32.
+    """
+    if account is None:
+        return None
+    s = str(account).strip()
+    if not s:
+        return None
+    slug = "".join(ch if ch.isalnum() or ch in "_-." else "_" for ch in s)
+    return slug[:32]
+
+
+def state_path(account: str | None, base: Path = DEFAULT_STATE_PATH) -> Path:
+    """File state cho account: None → quota.json; có label → quota-<slug>.json."""
+    acct = sanitize_account(account)
+    if acct is None:
+        return base
+    return base.with_name(f"quota-{acct}.json")
+
+
+def load_account(account: str | None, path: Path = DEFAULT_STATE_PATH) -> QuotaState:
+    """Load state của 1 account (None → legacy quota.json)."""
+    return load(state_path(account, path))
+
+
+def save_account(state: QuotaState, account: str | None,
+                 path: Path = DEFAULT_STATE_PATH) -> None:
+    save(state, state_path(account, path))
+
+
+# --------------------------------------------------------------------------- #
 # Load / save
 # --------------------------------------------------------------------------- #
 def load(path: Path = DEFAULT_STATE_PATH) -> QuotaState:
@@ -123,7 +159,15 @@ def record_success(state: QuotaState, kind: str, now: float | None = None) -> No
 
 def record_limit_hit(state: QuotaState, kind: str, now: float | None = None) -> int:
     """Ghi lần hit limit. Auto-learn threshold = count hiện tại (sau khi đã count).
-    Trả về threshold đã học (hoặc giữ nguyên nếu đã học)."""
+    Trả về threshold đã học (hoặc giữ nguyên nếu đã học).
+
+    Phân loại limit-hit để CLI/agent biết phải chờ kiểu daily (24h) hay burst
+    (rate-limit thoáng, có thể retry sau vài phút):
+      - count > 0  → "daily" (đã có history trong window → chắc chắn daily cap)
+      - count == 0 → "burst" (chưa có history → nhiều khả năng rate-limit thoáng,
+                                không học threshold)
+    Lưu vào last_limit_hit[kind]["type"] để snapshot() và CLI đọc lại.
+    """
     now = now if now is not None else time.time()
     count = count_recent(state, kind, now)
     # threshold = count (số gen thành công trước khi bị chặn). Nếu bằng 0 thì không học
@@ -133,7 +177,8 @@ def record_limit_hit(state: QuotaState, kind: str, now: float | None = None) -> 
         # ưu tiên giá trị thấp hơn (conservative) hoặc lần đầu
         if prev is None or count < prev:
             state.threshold[kind] = count
-    state.last_limit_hit[kind] = {"t": now, "count_at_hit": count}
+    limit_type = "daily" if count > 0 else "burst"
+    state.last_limit_hit[kind] = {"t": now, "count_at_hit": count, "type": limit_type}
     return state.threshold.get(kind) or count
 
 
@@ -173,14 +218,84 @@ def reset_eta_seconds(state: QuotaState, kind: str, now: float | None = None) ->
     return (oldest + state.window_seconds) - now
 
 
+def oldest_unlock_at(state: QuotaState, kind: str, now: float | None = None) -> float | None:
+    """Unix timestamp khi 1 slot quota được unlock (= oldest entry roll ra window).
+    None nếu chưa có history. Hữu ích cho agent schedule job chính xác tới thời điểm đó."""
+    now = now if now is not None else time.time()
+    hist = state.history.get(kind, [])
+    if not hist:
+        return None
+    return min(hist) + state.window_seconds
+
+
+def classify_limit_hit(state: QuotaState, kind: str) -> str:
+    """Phân loại lần hit limit cuối: "daily" / "burst" / "unknown".
+
+    Dựa trên last_limit_hit[kind]["type"] mà record_limit_hit() đã lưu. Trả "unknown"
+    nếu kind chưa từng hit limit. CLI dùng để chọn hint phù hợp:
+      - daily → "chờ rolling window (có thể vài giờ)"
+      - burst → "thử lại sau 5-10 phút"
+      - unknown → không có history để phán đoán
+    """
+    hit = state.last_limit_hit.get(kind)
+    if not isinstance(hit, dict):
+        return "unknown"
+    return hit.get("type") or "unknown"
+
+
 def is_exhausted_message(text: str) -> bool:
     """Check xem text bot message có phải báo quota hết không."""
     low = text.lower()
     return any(p in low for p in QUOTA_EXHAUSTED_PATTERNS)
 
 
+def plan_retry(info: dict | None, kind: str | None = None, now: float | None = None, *,
+               burst_retry_seconds: float = 300.0,
+               unknown_retry_seconds: float = 120.0,
+               resume_buffer_seconds: float = 15.0) -> tuple[float | None, str]:
+    """Tính thời gian chờ (giây) trước khi re-enqueue 1 job bị quota từ chối.
+
+    info = snapshot quota của kind (từ detail.quota của 429 hoặc job["quota"]).
+    Nhận cả 2 shape: sub-dict ({"remaining": …}) hoặc wrapped ({"image": {…}})
+    khi truyền kèm `kind` (driver trả wrapped, server 429 trả unwrapped).
+
+    Trả (delay, reason):
+      - daily cap → chờ tới khi slot cũ nhất roll ra window + buffer an toàn
+        (ưu tiên oldest_unlock_at; fallback reset_in_seconds thành timestamp).
+      - burst     → rate-limit thoáng, chờ burst_retry_seconds rồi thử lại.
+      - unknown   → không rõ, chờ unknown_retry_seconds (fail-safe).
+      - (None, _) → thiếu dữ kiện — caller tự chọn fallback.
+
+    Pure + clock injectable (now) — deterministic trong test.
+    """
+    now = now if now is not None else time.time()
+    if kind and isinstance(info, dict) and isinstance(info.get(kind), dict):
+        info = info[kind]
+    if not isinstance(info, dict):
+        return None, "no quota info"
+    ltype = info.get("last_limit_type")
+    if ltype == "daily":
+        unlock = info.get("oldest_unlock_at")
+        if not isinstance(unlock, (int, float)) or isinstance(unlock, bool):
+            eta = info.get("reset_in_seconds")
+            if isinstance(eta, (int, float)) and not isinstance(eta, bool):
+                unlock = now + eta
+        if isinstance(unlock, (int, float)) and not isinstance(unlock, bool):
+            return max(unlock + resume_buffer_seconds - now, 0.0), "daily cap"
+        return None, "daily cap, không rõ thời điểm unlock"
+    if ltype == "burst":
+        return burst_retry_seconds, "rate-limit burst"
+    return unknown_retry_seconds, "limit type unknown"
+
+
 def snapshot(state: QuotaState, kind: str | None = None, now: float | None = None) -> dict:
-    """Trả dict summary để hiển thị (cici quota / API)."""
+    """Trả dict summary để hiển thị (cici quota / API).
+
+    Trường bổ sung (cho agent scheduler + CLI hint):
+      - oldest_unlock_at     : unix ts khi 1 slot unlock (None nếu không có history)
+      - last_limit_type      : "daily" / "burst" / None (phân loại lần hit cuối)
+      - suggested_retry_after: seconds — tiện cho agent không cần tự tính
+    """
     now = now if now is not None else time.time()
     kinds = [kind] if kind else ["image", "video"]
     out = {}
@@ -189,13 +304,17 @@ def snapshot(state: QuotaState, kind: str | None = None, now: float | None = Non
         thr = state.threshold.get(k)
         rmn = remaining(state, k, now)
         eta = reset_eta_seconds(state, k, now)
+        unlock = oldest_unlock_at(state, k, now)
         hit = state.last_limit_hit.get(k)
         out[k] = {
             "used_in_window": cnt,
             "threshold": thr,
             "remaining": rmn,
             "reset_in_seconds": round(eta, 0) if eta is not None else None,
+            "oldest_unlock_at": round(unlock, 0) if unlock is not None else None,
             "last_limit_hit_at": hit.get("t") if hit else None,
+            "last_limit_type": hit.get("type") if hit else None,
+            "suggested_retry_after": max(round(eta, 0), 0) if eta is not None else None,
             "window_hours": round(state.window_seconds / 3600, 1),
         }
     return out

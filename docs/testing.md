@@ -2,10 +2,22 @@
 
 ## Current test boundary
 
-The repository currently has no hermetic unit-test suite. `test_e2e.py` is a live
-smoke script: it expects the API and a signed-in Cici CDP session, submits a real
-image job, consumes quota, polls for up to 320 seconds, and requires a human to
-inspect the printed result. It is not safe as a default validation command.
+Hermetic suites (no Cici, no quota, no live generation — safe to run any time
+from the repository root):
+
+| Suite | What it exercises |
+| --- | --- |
+| `python tests/test_wait_status.py` | Queue-aware client polling, adaptive backoff, terminal-state short-circuit |
+| `python tests/test_result_detection.py` | The exact result-polling/full-size JS against fixture DOMs |
+| `python tests/test_quota.py` | Quota rolling window, limit classification, `plan_retry`, CLI `--wait-for-quota` loop (mocked HTTP) |
+| `python tests/test_accounts.py` | Account-label quota isolation and CLI `--account` plumbing |
+| `python tests/test_persist.py` | Job persistence: fail-open loads, ephemeral-key stripping, boot reconcile, retention pruning |
+| `python tests/stress_test.py` | The real FastAPI server + worker + CLI subprocesses with a scriptable fake driver; redirects `~/.cici` state into a temp home so it never touches user quota/job files |
+
+`test_e2e.py` remains a live smoke script: it expects the API and a signed-in
+Cici CDP session, submits a real image job, consumes quota, polls for up to
+320 seconds, and requires a human to inspect the printed result. It is not
+safe as a default validation command.
 
 `inspect_dom.py` does not type or click, but it connects to the user's browser
 session and brings the selected Cici page to the foreground.
@@ -19,7 +31,7 @@ meaningful evidence for the change.
 2. For Python edits, compile the touched modules. A repository-wide syntax check is:
 
    ```powershell
-   python -m compileall -q main.py cici_driver.py inspect_dom.py test_e2e.py cici
+   python -m compileall -q main.py cici_driver.py cici tests
    ```
 
 3. For import, schema, or route changes, import the application if dependencies

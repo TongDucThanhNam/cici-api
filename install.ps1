@@ -48,6 +48,6 @@ if (Test-Path "$scriptsDir\cici.exe") {
 Write-Host "`n=== Hoàn tất ===" -ForegroundColor Cyan
 Write-Host "Bước tiếp theo (xem README.md):" -ForegroundColor White
 Write-Host "  1. Chạy start_cici.bat  (khởi động Cici có CDP)"
-Write-Host "  2. Chạy uvicorn main:app --port 8000  (core server)"
+Write-Host "  2. Server tự khởi động khi gen lần đầu (muốn chạy tay: python -m cici.server)"
 Write-Host "  3. Mở terminal MỚI rồi: cici health  (test)"
 Write-Host ""
