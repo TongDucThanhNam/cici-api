@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -362,7 +363,14 @@ class CiciDriver:
             await asyncio.sleep(self.tm["ui_step_delay"])
         tab = self.sel["creation_tab_image" if kind == "image" else "creation_tab_video"]
         tab_loc = page.locator('[data-testid="chat_input"]').locator(tab).first
-        await tab_loc.wait_for(state="visible", timeout=10000)
+        try:
+            # SPA boot chậm sau idle lâu (tab render ~7s, có lúc >10s) —
+            # chờ dài, và nếu vẫn mất thì goto lại một lần trước khi bỏ
+            await tab_loc.wait_for(state="visible", timeout=15000)
+        except Exception:  # noqa: BLE001
+            await page.goto(url, wait_until="domcontentloaded")
+            await asyncio.sleep(self.tm["ui_step_delay"])
+            await tab_loc.wait_for(state="visible", timeout=15000)
         await tab_loc.click()
         await asyncio.sleep(self.tm.get("tab_delay", self.tm["ui_step_delay"]))
 
@@ -390,6 +398,14 @@ class CiciDriver:
             f"Valid: {[o['alias'] for o in opts]}"
         )
 
+    @staticmethod
+    def _has_text(select_text: str | list[str]):
+        """select_text là string, hoặc list chuỗi đa ngôn ngữ (UI Cici có
+        locale VI/EN) — list → regex khớp bất kỳ chuỗi nào."""
+        if isinstance(select_text, list):
+            return re.compile("|".join(re.escape(t) for t in select_text))
+        return select_text
+
     async def _select_model(self, kind: str, alias: str | None) -> None:
         """Open model dropdown + click option. LUÔN chọn (kể cả default) —
         UI giữ model chọn lần cuối, không tin trạng thái mặc định."""
@@ -400,7 +416,8 @@ class CiciDriver:
         ).first.click()
         await asyncio.sleep(self.tm.get("dropdown_delay", 0.6))
         # Radix menu render ở body level (popper wrapper), không nằm trong chat_input
-        await page.locator(self.sel["model_option"], has_text=opt["select_text"]).first.click()
+        await page.locator(self.sel["model_option"],
+                            has_text=self._has_text(opt["select_text"])).first.click()
         await asyncio.sleep(self.tm["ui_step_delay"])
 
     async def _select_dropdown(self, kind: str, group: str, alias: str,
@@ -412,7 +429,8 @@ class CiciDriver:
             button_sel
         ).first.click()
         await asyncio.sleep(self.tm.get("dropdown_delay", 0.6))
-        await page.locator(self.sel["model_option"], has_text=opt["select_text"]).first.click()
+        await page.locator(self.sel["model_option"],
+                           has_text=self._has_text(opt["select_text"])).first.click()
         await asyncio.sleep(self.tm["ui_step_delay"])
 
     async def _upload_references(self, paths: list[str]) -> None:
@@ -469,8 +487,15 @@ class CiciDriver:
             await editor.wait_for(state="visible", timeout=8000)
             await editor.click()
             await asyncio.sleep(self.tm.get("editor_focus_delay", 0.3))
-            await inp.locator(self.sel["editor_prose"]).last.type(prompt, delay=8)
-        except Exception:  # noqa: BLE001
+            # xoá nội dung còn sót (job fail trước có thể để lại prompt dở),
+            # rồi chèn nguyên khối qua một lệnh CDP. Type() từng ký tự với
+            # delay 8ms quá chậm và dễ vỡ với prompt dài: ProseMirror
+            # re-render giữa chừng làm action timeout.
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Delete")
+            await page.keyboard.insert_text(prompt)
+        except Exception as e:  # noqa: BLE001 — fallback to textarea (build cũ)
+            log.warning("TiPTap prompt insert failed (%s); trying textarea fallback", e)
             ta = inp.locator(self.sel["chat_textarea"]).last
             await ta.wait_for(state="visible", timeout=10000)
             await ta.fill(prompt)

@@ -37,9 +37,10 @@ selectors:
   model_option: '[role="menuitem"]'
 
   # --- Tỷ lệ khung hình (image: có mô tả kèm; video: bare) ---
-  ratio_button: 'button:has-text("Tỷ lệ")'
+  # Nhãn nút theo locale UI (VI/EN) — khớp bất kỳ.
+  ratio_button: 'button:has-text("Ratio"), button:has-text("Tỷ lệ")'
   # --- Phong cách (image only) ---
-  style_button: 'button:has-text("Phong cách")'
+  style_button: 'button:has-text("Style"), button:has-text("Phong cách")'
   # --- Thời lượng video (nút hiển thị giá trị hiện tại: 5s hoặc 10s) ---
   duration_button: 'button:has-text("5s"), button:has-text("10s")'
 
@@ -125,8 +126,9 @@ models:
 
 # --------------------------------------------------------------------------- #
 # Generation options per kind (ratio / style / duration).
-# `alias` = giá trị API/CLI. `select_text` = substring khớp trong menuitem.
-# Image ratios có mô tả kèm trong menu (vd "1:1 (ảnh hồ sơ)") — match bằng alias.
+# `alias` = giá trị API/CLI. `select_text` = substring khớp trong menuitem;
+# list = alternatives đa ngôn ngữ (UI Cici có locale VI/EN — khớp bất kỳ).
+# Image ratios có mô tả kèm trong menu (vd "1:1 (profile photo)") — match bằng alias.
 # Verify trên build 147.0.7727.149.
 # --------------------------------------------------------------------------- #
 options:
@@ -139,19 +141,19 @@ options:
       - { alias: "9:16", select_text: "9:16" }
       - { alias: "16:9", select_text: "16:9" }
     styles:
-      - { alias: portrait,          select_text: "Chân dung" }
-      - { alias: landscape,         select_text: "Phong cảnh" }
+      - { alias: portrait,          select_text: ["Chân dung", "Portraits"] }
+      - { alias: landscape,         select_text: ["Phong cảnh", "Landscape"] }
       - { alias: anime,             select_text: "Anime" }
       - { alias: 3d,                select_text: "3D" }
       - { alias: cyberpunk,         select_text: "cyberpunk" }
-      - { alias: oil-painting,      select_text: "Tranh sơn dầu" }
-      - { alias: watercolor,        select_text: "Màu nước" }
-      - { alias: flat-illustration, select_text: "Minh họa phẳng" }
-      - { alias: children-drawing,  select_text: "Tranh vẽ của trẻ em" }
+      - { alias: oil-painting,      select_text: ["Tranh sơn dầu", "Oil Painting"] }
+      - { alias: watercolor,        select_text: ["Màu nước", "Watercolor"] }
+      - { alias: flat-illustration, select_text: ["Minh họa phẳng", "Flat Illustration"] }
+      - { alias: children-drawing,  select_text: ["Tranh vẽ của trẻ em", "Children's Drawing"] }
       - { alias: pixel,             select_text: "Pixel" }
-      - { alias: colored-pencil,    select_text: "Bút chì màu" }
-      - { alias: ink-wash,          select_text: "Thủy mặc" }
-      - { alias: ink,               select_text: "In mực" }
+      - { alias: colored-pencil,    select_text: ["Bút chì màu", "Colored Pencil"] }
+      - { alias: ink-wash,          select_text: ["Thủy mặc", "Ink Wash"] }
+      - { alias: ink,               select_text: ["In mực", "Ink Print"] }
   video:
     ratios:
       - { alias: "1:1",  select_text: "1:1" }

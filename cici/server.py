@@ -126,7 +126,7 @@ app = FastAPI(title="Cici API Wrapper", version=__version__, lifespan=lifespan)
 # Schemas
 # --------------------------------------------------------------------------- #
 class GenerateRequest(BaseModel):
-    prompt: str = Field(..., min_length=1, max_length=2000)
+    prompt: str = Field(..., min_length=1)  # không cap độ dài — Cici không giới hạn
     type: Literal["image", "video"] = "image"
     model: str | None = None   # alias from config.yaml models.<type>.options[].alias
     references: list[str] = Field(default_factory=list)  # local file paths for reference upload (image + video)

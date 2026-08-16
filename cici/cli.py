@@ -310,12 +310,21 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                     )
                 )
             return api.EXIT_QUOTA
-        except ValueError as e:  # invalid model alias / prompt
+        except ValueError as e:  # invalid alias/option/prompt (server 422)
+            # hint alias chỉ đúng cho lỗi unknown model/ratio/style/duration —
+            # với lỗi prompt thì hint này gây hiểu lầm
+            hint = ("Chạy `cici models` để xem alias hợp lệ."
+                    if str(e).startswith("Unknown ") else None)
             if as_json:
-                _emit_json({"status": "FAILED", "error": str(e),
-                            "hint": "Chạy `cici models` để xem alias hợp lệ."})
+                payload = {"status": "FAILED", "error": str(e)}
+                if hint:
+                    payload["hint"] = hint
+                _emit_json(payload)
             else:
-                out_console.print(f"[red]✗ {e}[/]\n[dim]Chạy `cici models` để xem alias hợp lệ.[/]")
+                line = f"[red]✗ {e}[/]"
+                if hint:
+                    line += f"\n[dim]{hint}[/]"
+                out_console.print(line)
             return api.EXIT_FAILED
         except Exception as e:  # noqa: BLE001 — server chết / mất kết nối lúc enqueue
             if as_json:

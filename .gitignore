@@ -25,6 +25,8 @@ server.log
 *.jpeg
 *.webp
 *.mp4
+# ...trừ icon README (deliverable cố ý, không phải media phát sinh)
+!assets/*.png
 
 # OS
 .DS_Store

@@ -26,9 +26,16 @@ Dola build **Chrome/147.0.7727.149**:
 - Tabs `creation-skill-switch-tab-image` / `-video` switch modality. Both tabs
   share the same reference button (`image-creation-chat-input-picture-reference-button`),
   which opens a native file chooser.
-- Image tab toolbar: Model (`Seedream 5.0 Pro` / `4.5`), Tỷ lệ (6 ratios), Phong
-  cách (13 styles). Video tab: Model (3 Seedance), duration button showing
-  `5s`/`10s`, Tỷ lệ (6 ratios, includes `21:9`).
+- Image tab toolbar: Model (`Seedream 5.0 Pro` / `4.5`), Ratio/Tỷ lệ (6 ratios),
+  Style/Phong cách (13 styles). Video tab: Model (3 Seedance), duration button
+  showing `5s`/`10s`, Ratio (6 ratios, includes `21:9`). The UI locale switches
+  between Vietnamese and English (observed EN after an app restart): toolbar
+  buttons are matched by bilingual `has-text` selectors in `config.yaml`
+  (`ratio_button`/`style_button`), and style `select_text` entries are lists of
+  VI/EN alternatives compiled to a regex by `CiciDriver._has_text`. These
+  buttons expose no stable `data-testid`/ARIA attribute (Radix-generated ids),
+  so localized text is currently the only handle — re-probe with
+  `inspect_dom.py` if a locale change breaks them again.
 - The model button shows the **last-selected** model, not a fixed default
   (observed: video tab opened on `Model 1.0`). The driver therefore always
   clicks the target model option, including the configured default.

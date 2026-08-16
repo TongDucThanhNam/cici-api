@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎨 Cici API Wrapper
+# <img src="assets/cici-api-icon.png" alt="Cici API logo" width="44" valign="middle"> Cici API Wrapper
 
 **Gen ảnh / video qua app Cici (Dola Browser) bằng 1 lệnh** — CLI + local API server cho AI coding agents.
 
@@ -69,6 +69,7 @@ cici image "mèo orange dễ thương, phong cách chibi" --json
 |---|---|
 | Python | ≥ 3.10 (đã test 3.14) |
 | App Cici | [Dola Browser / Cici](https://www.ciciai.com/) đã cài + đăng nhập |
+| Ngôn ngữ UI Cici | **Tiếng Việt hoặc English** — selector của tool khớp theo 2 locale này; ngôn ngữ khác làm chọn model/ratio/style fail (xem [Giới hạn đã biết](#giới-hạn-đã-biết)) |
 | OS | Windows: đầy đủ tính năng (auto-launch Cici + server). macOS/Linux: tự chạy server được, còn Cici phải mở thủ công với `--remote-debugging-port=9222` |
 
 ### pipx (khuyến nghị — giống npx: 1 lệnh, env isolate)
@@ -266,6 +267,8 @@ Payload đầy đủ (ngoài `prompt` đều optional):
 }
 ```
 
+- `prompt` — bắt buộc, không giới hạn độ dài (prompt rất dài sẽ tốn thời gian
+  typing vào Cici và tính vào timeout gen).
 - `references` — đường dẫn local, tối đa 10, hỗ trợ cả **video** (image-to-video).
 - `style` chỉ dùng cho image; `duration` chỉ cho video.
 - `account` — nhãn tuỳ chọn để tách quota local theo account (bạn tự đổi account
@@ -315,14 +318,20 @@ Thứ tự resolve (xem `cici/_config.py`):
 3. `~/.cici/config.yaml` — bản user-editable (server tự copy từ default lần đầu)
 4. config đóng gói trong package (fallback)
 
+> ⚠️ **Bẫy config drift**: `~/.cici/config.yaml` được tạo **một lần** ở lần chạy
+> đầu và **không tự nâng cấp** — nó shadow config repo/package mãi. Sau khi sửa
+> selector trong repo hoặc upgrade package mà hành vi không đổi: server đang
+> đọc bản cũ trong `~/.cici/` — copy config mới đè lên, hoặc xoá file đó để
+> server tái tạo từ default (mất custom edit nếu có).
+
 Trích yếu quan trọng:
 
 ```yaml
 selectors:
   creation_tab_image: '[data-testid="creation-skill-switch-tab-image"]'   # build 147.0.7727.149+
   model_button: 'button:has-text("Model")'
-  ratio_button: 'button:has-text("Tỷ lệ")'
-  style_button: 'button:has-text("Phong cách")'        # image only
+  ratio_button: 'button:has-text("Ratio"), button:has-text("Tỷ lệ")'   # VI/EN
+  style_button: 'button:has-text("Style"), button:has-text("Phong cách")'   # VI/EN, image only
   duration_button: 'button:has-text("5s"), button:has-text("10s")'   # video only
   ref_button: '[data-testid="image-creation-chat-input-picture-reference-button"]'
   send_button: '[data-testid="chat_input_send_button"]'
@@ -359,6 +368,7 @@ timing:
 | Server restart giữa job | Job đang chờ/xử lý bị đánh FAILED (lỗi "server restarted mid-job") khi server lên lại — enqueue lại là xong. Job đã xong vẫn tra cứu được bằng `cici status` sau restart (lưu 7 ngày trong `~/.cici/jobs.json`). |
 | Đã sửa code/config nhưng hành vi cũ | Lệnh `cici` luôn dùng code mới; **server chạy ngầm giữ code cũ** — kill rồi cho CLI spawn lại: `taskkill /F /PID <pid của cổng 8000>` (tìm bằng `netstat -ano | findstr :8000`). |
 | Cici đổi UI → job FAILED liên tục | Chạy `python inspect_dom.py` / `python inspect_skills.py`, sửa selector trong `~/.cici/config.yaml`. |
+| Job FAILED: `Locator.click: Timeout` chờ `button:has-text("Ratio"/"Tỷ lệ"…)` | UI Cici đang ở ngôn ngữ ngoài VI/EN (app restart có thể tự đổi locale). Đặt ngôn ngữ app về Tiếng Việt/English, hoặc thêm nhãn ngôn ngữ đó vào `config.yaml` (xem [Giới hạn đã biết](#giới-hạn-đã-biết)). |
 | `429` / exit 4 liên tục | Hết quota rolling 24h — xem `cici quota`, chờ reset. Muốn reset thủ công: xoá `~/.cici/quota.json`. |
 
 ---
@@ -367,7 +377,13 @@ timing:
 
 - **Content block / bản quyền** — Cici có thể ĐÃ gen xong nhưng **từ chối hiển thị kết quả** (vd "...vì âm thanh trong video..."). Driver detect refusal → trạng thái `CONTENT_BLOCKED` (exit 1), fail nhanh thay vì spin tới timeout. Đây là filter của Cici (không phải lỗi tool) → đổi ảnh tham chiếu / sửa prompt rồi retry (vd thêm `no sound` / `silent` cho video). Patterns ở `config.yaml` → `messages.refusal_patterns`.
 - **Watermark "AI generated"** — Cici áp lên chính file gốc; không có bản no-watermark qua UI này.
-- **Model/ratio/style text là localized** — `select_text` theo ngôn ngữ UI Cici; đổi ngôn ngữ = cập nhật config.
+- **UI Cici phải để Tiếng Việt hoặc English** — nút Model/Ratio/Style không có
+  `data-testid` ổn định nên tool khớp bằng nhãn text (đã song ngữ VI/EN trong
+  `config.yaml`), style options và refusal detection cũng VI/EN. Ngôn ngữ khác
+  (Nhật/Trung/Hàn…) → job fail ở bước chọn model/ratio/style (`Locator.click:
+  Timeout`). Fix: đổi ngôn ngữ app Cici về VI/EN, hoặc thêm nhãn ngôn ngữ đó
+  vào `selectors` + `select_text` trong `config.yaml` (lấy text chính xác qua
+  `python inspect_dom.py`).
 - **Tốc độ** — tuần tự ~2 phút/job ảnh; không phù hợp throughput cao.
 - **Quota** — dùng quota free của account Cici; rate-limit / block có thể xảy ra bất cứ lúc nào.
 - **UI Cici cập nhật** = phải re-inspect config (xem [Xử lý sự cố](#xử-lý-sự-cố)).

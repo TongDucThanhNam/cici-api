@@ -89,6 +89,14 @@ def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 
             detail = r.json().get("detail", "invalid request")
         except Exception:
             detail = "invalid request"
+        if isinstance(detail, list):
+            # FastAPI validate schema → detail là list lỗi Pydantic — nén lại
+            # thành string đọc được thay vì dump list repr nguyên khối
+            detail = "; ".join(
+                f"{'.'.join(str(x) for x in d.get('loc', [])[1:]) or 'body'}: "
+                f"{d.get('msg', '')}"
+                for d in detail if isinstance(d, dict)
+            ) or "invalid request"
         raise ValueError(detail)
     if r.status_code == 429:
         # server refuse vì local quota estimate = 0
