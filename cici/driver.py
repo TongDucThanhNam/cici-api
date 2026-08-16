@@ -622,6 +622,13 @@ class CiciDriver:
             await asyncio.sleep(interval)
         raise TimeoutError(f"No result within {timeout}s")
 
+    def _fullsize_marker(self) -> str:
+        """Marker template URL bản gốc theo provider hiện tại
+        (selectors.fullsize_markers.<provider> → fallback fullsize_image_marker)."""
+        return (self.sel.get("fullsize_markers", {})
+                .get(self._current_provider)
+                or self.sel.get("fullsize_image_marker", ""))
+
     async def _upgrade_to_fullsize(self, preview_urls: list[str],
                                    bot_count_before: int = 0) -> list[str]:
         """Đổi preview URL (downsize_watermark, ~288px) lấy ảnh GỐC full-size.
@@ -633,10 +640,18 @@ class CiciDriver:
         listener bắt thêm các URL viewer prefetch. Match theo base path (URL
         trước '~tplv') của preview URL — không lấy nhầm ảnh job khác.
 
+        Doubao (provider doubao): click ảnh mở SIDE PANEL (không phải modal
+        viewer); bản gốc `i_pre_wm` (vd 2848x1600) chỉ đi qua NETWORK — DOM img
+        giữ preview URL — nên network listener là nguồn chính, DOM poll không
+        ra gì (vô hại). Escape có thể không đóng panel — không sao: click ảnh
+        kế vẫn hoạt động, và job sau goto lại trang create-image.
+
         Fail-safe: mọi bước bọc try/except — nếu viewer không mở / marker đổi /
         timeout thì trả lại preview URLs (kết quả cũ vẫn dùng được).
         """
-        marker = self.sel.get("fullsize_image_marker", "")
+        # marker bản full-size theo provider (cici: image_pre_watermark;
+        # doubao: i_pre_wm — xem selectors.fullsize_markers trong config)
+        marker = self._fullsize_marker()
         if not marker or not preview_urls:
             return preview_urls
         bases = {u.split("~tplv")[0]: u for u in preview_urls if "~tplv" in u}

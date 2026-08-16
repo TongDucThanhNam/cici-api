@@ -72,6 +72,42 @@ def _quota_hint_lines(quota_info: dict | None) -> list[str]:
     return lines
 
 
+def _alt_provider_hint(current: str) -> str | None:
+    """Gợi ý đổi provider khi quota provider hiện tại cạn.
+
+    Quota tách theo app (Cici/Doubao không chung window) — provider khác còn
+    khả dụng (exe cài sẵn hoặc CDP đang sống) là "quota dự phòng" dùng được
+    ngay. Trả None nếu không có lựa chọn thay thế.
+    """
+    try:
+        provs = _launcher._providers_cfg()
+    except Exception:  # noqa: BLE001 — config hỏng thì im lặng, đừng phá hint gốc
+        return None
+    alts = []
+    for name, p in provs.items():
+        if name == current:
+            continue
+        if _launcher._find_app_exe(name) or \
+                _launcher._cdp_alive(_launcher._cdp_endpoint(name)):
+            alts.append((name, p.get("label", name)))
+    if not alts:
+        return None
+    flags = " / ".join(f"--provider {n}" for n, _ in alts)
+    labels = " / ".join(lbl for _, lbl in alts)
+    return (f"Quota {labels} là RIÊNG (app khác, không chung window) — "
+            f"chạy lại với {flags} để gen ngay.")
+
+
+def _quota_hint_with_alts(quota_info: dict | None, provider: str) -> list[str]:
+    """_quota_hint_lines + gợi ý đổi provider (nếu có) — dùng chung cho cả
+    Panel lẫn JSON hint array."""
+    lines = _quota_hint_lines(quota_info)
+    alt = _alt_provider_hint(provider)
+    if alt:
+        lines.append(alt)
+    return lines
+
+
 def _quota_sleep(delay: float, reason: str, kind: str, attempt: int) -> None:
     """Ngủ `delay` giây theo chunk 60s — Ctrl+C phản hồi nhanh + tiến độ định kỳ.
 
@@ -173,7 +209,7 @@ def _preflight_auto(base: str, provider: str = "cici") -> bool:
         for kind, info in snap.items():
             rmn = info.get("remaining")
             if rmn is not None and rmn == 0:
-                hints = _quota_hint_lines(info)
+                hints = _quota_hint_with_alts(info, provider)
                 hint_block = "\n".join(hints)
                 tail = f"\n{hint_block}" if hint_block else ""
                 console.print(
@@ -289,7 +325,8 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
         except api.QuotaExhausted as e:
             # server refuse vì local quota estimate = 0 (đừng lãng phí thời gian gen)
             quota_snap = e.detail.get("quota") if isinstance(e.detail, dict) else None
-            hint_lines = _quota_hint_lines(quota_snap if isinstance(quota_snap, dict) else None)
+            hint_lines = _quota_hint_with_alts(
+                quota_snap if isinstance(quota_snap, dict) else None, provider)
             if quota_wait and attempt < max_attempts \
                     and _quota_wait_then_retry(quota_snap, kind, attempt, deadline,
                                                qcfg, unknown_retry):
@@ -345,7 +382,8 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
 
         # QUOTA_EXHAUSTED giữa job — job mang theo snapshot quota để tính thời điểm chờ
         quota_snap = job.get("quota")
-        hint_lines = _quota_hint_lines(quota_snap if isinstance(quota_snap, dict) else None)
+        hint_lines = _quota_hint_with_alts(
+            quota_snap if isinstance(quota_snap, dict) else None, provider)
         if quota_wait and attempt < max_attempts \
                 and _quota_wait_then_retry(quota_snap, kind, attempt, deadline,
                                            qcfg, unknown_retry):

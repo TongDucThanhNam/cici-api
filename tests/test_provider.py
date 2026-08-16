@@ -217,8 +217,60 @@ def main() -> int:
     else:
         print(f"FAIL 9: db_keys={list(models_db)[:3]} cici_keys={list(models_cici)[:3]}")
 
-    print(f"\n{passed}/9 tests passed")
-    return 0 if passed == 9 else 1
+    # ------------------------------------------------------------------ #
+    # alt-provider hint khi quota cạn
+    # ------------------------------------------------------------------ #
+    from cici import _launcher
+
+    _orig3 = (_launcher._providers_cfg, _launcher._find_app_exe, _launcher._cdp_alive)
+    _launcher._providers_cfg = lambda: {"cici": {"label": "Cici (Dola)", "cdp_port": 9222},
+                                        "doubao": {"label": "Doubao (豆包)", "cdp_port": 9223}}
+    _launcher._cdp_alive = lambda endpoint, timeout=2.0: False
+    try:
+        # cài sẵn cả hai app → hint hai chiều đều có
+        _launcher._find_app_exe = lambda p: f"C:/fake/{p}.exe"
+        import cici.cli as cli2
+        h10 = cli2._alt_provider_hint("cici")
+        ok10 = (h10 is not None and "--provider doubao" in h10
+                and "RIÊNG" in h10)
+        if ok10:
+            passed += 1
+            print("PASS 10: quota cạn cici → gợi ý --provider doubao (khi Doubao available)")
+        else:
+            print(f"FAIL 10: {h10!r}")
+
+        h11 = cli2._alt_provider_hint("doubao")
+        if h11 is not None and "--provider cici" in h11:
+            passed += 1
+            print("PASS 11: quota cạn doubao → gợi ý ngược --provider cici")
+        else:
+            print(f"FAIL 11: {h11!r}")
+
+        _launcher._find_app_exe = lambda p: "C:/fake/Cici.exe" if p == "cici" else None
+        # doubao không exe + không CDP (cdp_alive đã False) → không gợi ý gì
+        h12 = cli2._alt_provider_hint("cici")
+        if h12 is None:
+            passed += 1
+            print("PASS 12: không có provider thay thế → None (không hint ảo)")
+        else:
+            print(f"FAIL 12: {h12!r}")
+    finally:
+        _launcher._providers_cfg, _launcher._find_app_exe, _launcher._cdp_alive = _orig3
+
+    # 13. full-size marker theo provider (doubao: i_pre_wm qua network,
+    # cici: image_pre_watermark qua DOM viewer)
+    drv._current_provider = "cici"
+    m_cici = drv._fullsize_marker()
+    drv._current_provider = "doubao"
+    m_db = drv._fullsize_marker()
+    if m_cici == "image_pre_watermark" and m_db == "i_pre_wm":
+        passed += 1
+        print("PASS 13: full-size marker theo provider (cici=pre_watermark, doubao=i_pre_wm)")
+    else:
+        print(f"FAIL 13: cici={m_cici!r} doubao={m_db!r}")
+
+    print(f"\n{passed}/13 tests passed")
+    return 0 if passed == 13 else 1
 
 
 if __name__ == "__main__":

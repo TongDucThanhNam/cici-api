@@ -72,7 +72,12 @@ rejected server-side for `provider=doubao`.
   (before `~tplv`) so other jobs' images can't leak in. Marker lives in
   `selectors.fullsize_image_marker`; timings in `timing.fullsize_wait` /
   `fullsize_each_wait` / `viewer_close_delay`. Any failure falls back to the
-  preview URLs — the job still completes.
+  preview URLs — the job still completes. **Doubao difference**: clicking a
+  result opens a **side panel** (not a modal viewer; stable
+  `edit_image_download_button` lives there) and the full-size template is
+  `i_pre_wm` (e.g. 2848×1600) which appears **only on the network** — the DOM
+  `<img>` keeps the preview src, so the request listener is the only source.
+  Marker per provider: `selectors.fullsize_markers.<provider>`.
 
 ## Selector-change workflow
 

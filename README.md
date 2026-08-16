@@ -30,7 +30,7 @@
 - **1 lệnh là xong**: `cici image "prompt"` — tự khởi động Cici (có CDP) + server nếu thiếu, block tới khi có kết quả.
 - **2 provider**: Cici (Dola — mặc định) và **Doubao (豆包 — bản TQ cùng codebase)**: `--provider doubao`. Registry model + quota riêng, Seedream 5.0 Pro/5.0 Lite có ở Doubao, CDP song song 2 app (9222/9223).
 - **Cho AI agent**: `--json` stdout sạch, exit codes chuẩn hoá (0/1/2/3/4), timeout đồng bộ từ server.
-- **Ảnh gốc full-size** — tự nâng từ preview ~288px lên bản gốc (vd 1773×2364) qua image viewer.
+- **Ảnh gốc full-size** — tự nâng từ preview (~288px/384px) lên bản gốc (vd 1773×2364 Cici, 2848×1600 Doubao) qua viewer/side-panel; mọi provider.
 - **Image + Video**: model Seedream/Seedance, ratio, style, duration, ảnh tham chiếu (image-to-video).
 - **Queue an toàn** — single-consumer, N agent gọi đồng thời vẫn xếp hàng đúng, `queue_ahead` minh bạch.
 - **Job persistence** — state ghi xuống `~/.cici/jobs.json`; restart server giữa job thì job in-flight bị đánh FAILED (kèm lỗi rõ ràng) thay vì biến mất, job đã xong vẫn tra cứu được sau restart (retention 7 ngày).
@@ -181,6 +181,8 @@ trong payload API):
 - Styles tiếng Trung (32 style: `anime`, `cyberpunk`, `monet`, `picasso`…), ratios
   có thêm `auto` + `3:2` (image) / `21:9` (video). Xem đầy đủ: `cici models --provider doubao`.
 - Quota state tách file riêng (`~/.cici/quota-doubao*.json`) — không dính quota Cici.
+- Ảnh **full-size gốc** cũng được nâng tự động như Cici (template `i_pre_wm`, vd
+  2848×1600) — click ảnh mở side panel, driver bắt URL bản gốc qua network.
 - Lưu ý launch: Doubao phải khởi động qua stub exe ở gốc `Application/Doubao.exe`
   (đã encode trong config) — launch exe trong `app/` sẽ bị lờ flag CDP.
 
@@ -342,11 +344,12 @@ Thứ tự resolve (xem `cici/_config.py`):
 3. `~/.cici/config.yaml` — bản user-editable (server tự copy từ default lần đầu)
 4. config đóng gói trong package (fallback)
 
-> ⚠️ **Bẫy config drift**: `~/.cici/config.yaml` được tạo **một lần** ở lần chạy
-> đầu và **không tự nâng cấp** — nó shadow config repo/package mãi. Sau khi sửa
-> selector trong repo hoặc upgrade package mà hành vi không đổi: server đang
-> đọc bản cũ trong `~/.cici/` — copy config mới đè lên, hoặc xoá file đó để
-> server tái tạo từ default (mất custom edit nếu có).
+> ⚠️ **Config drift**: `~/.cici/config.yaml` là bản user-editable shadow repo/
+> package. Từ v0.3.x nó **tự nâng cấp** khi config mới có `config_version` cao
+> hơn (bản cũ được backup `config.yaml.bak-<ts>`, edit tay trong bản cũ nếu có
+> sẽ nằm trong backup — tự merge lại nếu cần). Bản user cùng version/newer thì
+> không bị đụng. Nếu vừa upgrade/sửa repo mà hành vi không đổi: restart core
+> server (config load lúc import) và kiểm tra version trong file.
 
 Trích yếu quan trọng:
 

@@ -2,6 +2,12 @@
 # Khi Cici/Dola đổi UI, CHỈ cần sửa file này — không đụng vào code.
 # Selectors được verify trên Cici build Chromium 147.0.7727.149 (Dola Browser)
 # và Doubao (豆包 — bản TQ cùng codebase rebrand, build Chromium trùng số).
+#
+# config_version: bump khi đổi selector/registry/timing (bất kỳ thay đổi nào mà
+# bản ~/.cici/config.yaml cũ cần nhận). Server tự nâng cấp bản user khi thấy
+# version cao hơn (backup config.yaml.bak-<ts>), xem cici/_config.py.
+
+config_version: 3
 
 # --------------------------------------------------------------------------- #
 # Providers — mỗi app là một "chat surface" riêng (CDP endpoint + registry).
@@ -101,7 +107,13 @@ selectors:
   # Marker template của ảnh GỐC full-size mà image viewer lazy-load khi click
   # (preview trong chat là downsize_watermark ~288px; bản gốc là image_pre_watermark,
   # verify build 147.0.7727.149: 1773x2364). Đổi khi Cici đổi template.
+  # Marker template URL bản GỐC full-size trong viewer/panel (lazy-load):
+  # - Cici: image viewer swap src sang template "image_pre_watermark" (DOM).
+  # - Doubao: side panel chỉ fetch QUA NETWORK (DOM img giữ preview) —
+  #   template "i_pre_wm" (vd ...~tplv-...-i_pre_wm_16_marc...: 2848x1600).
   fullsize_image_marker: "image_pre_watermark"
+  fullsize_markers:            # override marker theo provider
+    doubao: "i_pre_wm"
   # Video kết quả: block video trong bot message. Chứa img.cover (thumbnail);
   # <video src> CHỈ được tạo khi click vào block (xgplayer lazy-init) -> driver click rồi đọc src.
   result_video: 'div[class*="block-video"]'
