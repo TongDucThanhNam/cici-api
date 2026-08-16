@@ -128,6 +128,7 @@ app = FastAPI(title="Cici API Wrapper", version=__version__, lifespan=lifespan)
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)  # không cap độ dài — Cici không giới hạn
     type: Literal["image", "video"] = "image"
+    provider: str = "cici"   # "cici" | "doubao" — app/CDP endpoint + registry riêng
     model: str | None = None   # alias from config.yaml models.<type>.options[].alias
     references: list[str] = Field(default_factory=list)  # local file paths for reference upload (image + video)
     ratio: str | None = None   # alias from config.yaml options.<type>.ratios[].alias (vd "16:9")
@@ -147,22 +148,52 @@ class GenerateResponse(BaseModel):
 # Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/api/models")
-async def list_models():
-    """List available models + generation options (ratios/styles/durations)."""
-    return {"models": cfg.get("models", {}), "options": cfg.get("options", {})}
+async def list_models(provider: str = "cici"):
+    """List available models + generation options (ratios/styles/durations).
+
+    ?provider=cici|doubao — registry của provider đó (mặc định cici = legacy
+    flat shape cho tương thích client cũ).
+    """
+    models = _provider_section("models", provider)
+    options = _provider_section("options", provider)
+    return {"models": models, "options": options, "provider": provider}
 
 
 @app.get("/api/quota")
-async def get_quota(kind: str | None = None, account: str | None = None):
+async def get_quota(kind: str | None = None, account: str | None = None,
+                    provider: str = "cici"):
     """Quota summary (rolling 24h local count + auto-learned threshold).
 
     ?kind=image/video để lọc; ?account=<nhãn> cho quota riêng từng account
-    (nhãn do người dùng tự gán — tool không tự đổi account).
+    (nhãn do người dùng tự gán — tool không tự đổi account);
+    ?provider= đọc state quota của provider (file state tách riêng).
     """
     if not _quota:
         raise HTTPException(status_code=501, detail="quota tracking unavailable (cici package missing)")
-    state = _quota.load_account(account)
+    state = _quota.load_account(account, provider=provider)
     return _quota.snapshot(state, kind)
+
+
+def _provider_section(section: str, provider: str) -> dict:
+    """models/options cho provider: legacy flat = cici; provider khác nằm ở
+    key trùng tên trong cùng section (models.doubao, options.doubao).
+
+    View legacy phải loại các key provider (models.doubao...) để client cũ
+    iterate kinds chỉ thấy image/video — không lộ registry provider khác."""
+    data = cfg.get(section, {})
+    prov_names = set(cfg.get("providers", {}) or {})
+    if provider in data:
+        return data[provider]
+    return {k: v for k, v in data.items() if k not in prov_names}
+
+
+def _validate_provider(provider: str) -> None:
+    valid = list(cfg.get("providers", {}).keys()) or ["cici"]
+    if provider not in valid:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown provider '{provider}'. Valid: {valid}",
+        )
 
 
 @app.post("/api/generate", response_model=GenerateResponse, status_code=202)
@@ -173,21 +204,24 @@ async def generate(req: GenerateRequest):
         raise HTTPException(status_code=422, detail="Prompt không được rỗng hoặc chỉ khoảng trắng")
     if "\x00" in req.prompt:
         raise HTTPException(status_code=422, detail="Prompt chứa ký tự null không hợp lệ")
-    # validate model alias if provided
+    _validate_provider(req.provider)
+    # validate model alias if provided (registry theo provider)
     if req.model:
-        registry = cfg.get("models", {}).get(req.type, {})
+        registry = _provider_section("models", req.provider).get(req.type, {})
         valid = [o["alias"] for o in registry.get("options", [])]
         if req.model not in valid:
             raise HTTPException(
                 status_code=422,
-                detail=f"Unknown model '{req.model}' for type '{req.type}'. Valid: {valid}",
+                detail=f"Unknown model '{req.model}' for type '{req.type}' "
+                       f"(provider {req.provider}). Valid: {valid}",
             )
     # validate generation options (ratio/style/duration) against config
-    opts = cfg.get("options", {}).get(req.type, {})
+    opts = _provider_section("options", req.provider).get(req.type, {})
     if req.ratio and req.ratio not in [o["alias"] for o in opts.get("ratios", [])]:
         raise HTTPException(
             status_code=422,
-            detail=f"Unknown ratio '{req.ratio}' for type '{req.type}'. "
+            detail=f"Unknown ratio '{req.ratio}' for type '{req.type}' "
+                   f"(provider {req.provider}). "
                    f"Valid: {[o['alias'] for o in opts.get('ratios', [])]}",
         )
     if req.style:
@@ -196,17 +230,25 @@ async def generate(req: GenerateRequest):
         if req.style not in [o["alias"] for o in opts.get("styles", [])]:
             raise HTTPException(
                 status_code=422,
-                detail=f"Unknown style '{req.style}' for type 'image'. "
+                detail=f"Unknown style '{req.style}' for type 'image' "
+                       f"(provider {req.provider}). "
                        f"Valid: {[o['alias'] for o in opts.get('styles', [])]}",
             )
     if req.duration:
         if req.type != "video":
             raise HTTPException(status_code=422, detail="duration chỉ hỗ trợ cho type=video")
-        if req.duration not in [o["alias"] for o in opts.get("durations", [])]:
+        durs = [o["alias"] for o in opts.get("durations", [])]
+        if not durs:
+            raise HTTPException(
+                status_code=422,
+                detail=f"duration không khả dụng cho provider '{req.provider}' "
+                       "(Doubao không có picker thời lượng riêng).",
+            )
+        if req.duration not in durs:
             raise HTTPException(
                 status_code=422,
                 detail=f"Unknown duration '{req.duration}' for type 'video'. "
-                       f"Valid: {[o['alias'] for o in opts.get('durations', [])]}",
+                       f"Valid: {durs}",
             )
     # account label (quota local tách theo nhãn): sanitize + từ chối nhãn lạ.
     # Tool KHÔNG đổi account — user tự đổi trong app Cici, label chỉ để đếm riêng.
@@ -222,7 +264,7 @@ async def generate(req: GenerateRequest):
     # để CLI/agent render ETA + phân loại daily vs burst.
     if _quota:
         try:
-            state = _quota.load_account(acct)
+            state = _quota.load_account(acct, provider=req.provider)
             rmn = _quota.remaining(state, req.type)
             if rmn is not None and rmn == 0:
                 snap = _quota.snapshot(state, req.type)
@@ -270,7 +312,7 @@ async def generate(req: GenerateRequest):
     job = Job(job_id=str(uuid.uuid4()), kind=req.type, prompt=req.prompt,
               model=req.model, references=refs,
               ratio=req.ratio, style=req.style, duration=req.duration,
-              account=acct)
+              account=acct, provider=req.provider)
     global _ENQUEUE_SEQ
     _ENQUEUE_SEQ += 1
     STORE.set(
@@ -278,7 +320,8 @@ async def generate(req: GenerateRequest):
         status="PENDING",
         seq=_ENQUEUE_SEQ,
         kind=job.kind,
-        model=job.model or cfg["models"][req.type]["default"],
+        provider=job.provider,
+        model=job.model or _provider_section("models", req.provider)[req.type]["default"],
         prompt=job.prompt,
         ratio=job.ratio,
         style=job.style,
@@ -287,7 +330,7 @@ async def generate(req: GenerateRequest):
         created_at=job.created_at,
     )
     await JOB_QUEUE.put(job)
-    log.info("Enqueued job %s (%s/%s, %d refs): %s", job.job_id, job.kind, job.model,
+    log.info("Enqueued job %s (%s/%s/%s, %d refs): %s", job.job_id, job.provider, job.kind, job.model,
              len(job.references), job.prompt[:60])
     return GenerateResponse(
         job_id=job.job_id,

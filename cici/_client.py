@@ -47,11 +47,13 @@ def status(job_id: str, base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict
     return r.json()
 
 
-def models(base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
-    """GET /api/models — registry {image: {...}, video: {...}}."""
+def models(base: str = DEFAULT_BASE, timeout: float = 10.0,
+           provider: str = "cici") -> dict:
+    """GET /api/models — registry {image: {...}, video: {...}} của provider."""
     try:
         with httpx.Client(timeout=timeout) as c:
-            r = c.get(f"{base}/api/models")
+            r = c.get(f"{base}/api/models",
+                      params={"provider": provider} if provider != "cici" else None)
         if r.status_code != 200:
             raise CiciUnreachable(f"models returned HTTP {r.status_code}")
         return r.json()
@@ -62,12 +64,14 @@ def models(base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
 def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 10.0,
              model: str | None = None, references: list[str] | None = None,
              ratio: str | None = None, style: str | None = None,
-             duration: str | None = None, account: str | None = None) -> dict:
+             duration: str | None = None, account: str | None = None,
+             provider: str = "cici") -> dict:
     """POST /api/generate -> trả response dict ngay (server enqueue, không block).
 
     Dict gồm job_id + timeout_s (server-config gen timeout cho kind — CLI dùng
     thay vì hardcode local). Raise ValueError nếu 422, QuotaExhausted nếu 429.
     account = nhãn tách quota local (user TỰ đổi account trong app Cici).
+    provider = "cici" (mặc định) hoặc "doubao" — app/CDP endpoint + registry riêng.
     """
     payload = {"prompt": prompt, "type": kind}
     if model:
@@ -82,6 +86,8 @@ def generate(prompt: str, kind: str, base: str = DEFAULT_BASE, timeout: float = 
         payload["duration"] = duration
     if account:
         payload["account"] = account
+    if provider and provider != "cici":
+        payload["provider"] = provider
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{base}/api/generate", json=payload)
     if r.status_code == 422:
@@ -122,16 +128,20 @@ TERMINAL_STATUSES = ("COMPLETED", "FAILED", "QUOTA_EXHAUSTED", "CONTENT_BLOCKED"
 
 
 def quota(kind: str | None = None, account: str | None = None,
-          base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
+          base: str = DEFAULT_BASE, timeout: float = 10.0,
+          provider: str = "cici") -> dict:
     """GET /api/quota — snapshot rolling 24h count + threshold.
 
-    ?kind=image/video lọc theo loại; ?account=<nhãn> quota riêng từng account.
+    ?kind=image/video lọc theo loại; ?account=<nhãn> quota riêng từng account;
+    ?provider= đọc state quota của provider đó (mặc định cici).
     """
     params = {}
     if kind:
         params["kind"] = kind
     if account:
         params["account"] = account
+    if provider and provider != "cici":
+        params["provider"] = provider
     with httpx.Client(timeout=timeout) as c:
         r = c.get(f"{base}/api/quota", params=params)
     r.raise_for_status()

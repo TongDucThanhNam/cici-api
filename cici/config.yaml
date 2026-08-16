@@ -1,6 +1,30 @@
 # Cici API Wrapper — central selector & timing config.
 # Khi Cici/Dola đổi UI, CHỈ cần sửa file này — không đụng vào code.
-# Selectors được verify trên Cici build Chromium 147.0.7727.149 (Dola Browser).
+# Selectors được verify trên Cici build Chromium 147.0.7727.149 (Dola Browser)
+# và Doubao (豆包 — bản TQ cùng codebase rebrand, build Chromium trùng số).
+
+# --------------------------------------------------------------------------- #
+# Providers — mỗi app là một "chat surface" riêng (CDP endpoint + registry).
+# Doubao lưu ý: phải launch qua STUB exe ở gốc Application/Doubao.exe thì flag
+# CDP mới được forward — launch thẳng app/Doubao.exe (kiểu Cici) sẽ bị lờ.
+# --------------------------------------------------------------------------- #
+providers:
+  cici:
+    label: "Cici (Dola)"
+    default: true
+    exe_env: "CICI_EXE"
+    exe_candidates:
+      - "Cici/Application/app/Cici.exe"    # exe versioned trong app/ — OK với Cici
+    cdp_port: 9222
+    # URL host pattern để tìm chat tab + check login
+    chat_host: "dola"
+  doubao:
+    label: "Doubao (豆包)"
+    exe_env: "DOUBAO_EXE"
+    exe_candidates:
+      - "Doubao/Application/Doubao.exe"    # STUB ở gốc — bắt buộc (xem note trên)
+    cdp_port: 9223
+    chat_host: "doubao"
 
 cdp:
   # Playwright connect_over_cdp target
@@ -16,6 +40,13 @@ cdp:
   # Ngân sách tối đa (s) để nối/re-nối CDP cho MỘT job trước khi đánh FAILED
   # (không để job treo PROCESSING vĩnh viễn + block cả queue khi Cici tắt).
   connect_timeout: 90
+  # Overlay cho provider khác (deep-merge đè lên các key phía trên).
+  # Cici dùng giá trị mặc định; Doubao = bản TQ (chrome://doubao-chat, CDP 9223).
+  providers:
+    doubao:
+      endpoint: "http://127.0.0.1:9223"
+      chat_url_pattern: "doubao-chat/chat"
+      create_image_url: "chrome://doubao-chat/chat/create-image"
 
 selectors:
   # --- Nút "Cuộc trò chuyện mới" (cần scope main vì có 2 instance) ---
@@ -33,14 +64,14 @@ selectors:
   # Nút "Model" trong input (text chứa "Model"), click để mở dropdown (Radix menu).
   # Options: [role="menuitem"], innerText = tên model. Click option matching select_text.
   # Các dropdown (model/tỷ lệ/phong cách/thời lượng) nằm TRONG [data-testid="chat_input"].
-  model_button: 'button:has-text("Model")'
+  model_button: 'button:has-text("Model"), button:has-text("模型")'
   model_option: '[role="menuitem"]'
 
   # --- Tỷ lệ khung hình (image: có mô tả kèm; video: bare) ---
-  # Nhãn nút theo locale UI (VI/EN) — khớp bất kỳ.
-  ratio_button: 'button:has-text("Ratio"), button:has-text("Tỷ lệ")'
+  # Nhãn nút theo locale UI (VI/EN/ZH) — khớp bất kỳ.
+  ratio_button: 'button:has-text("Ratio"), button:has-text("Tỷ lệ"), button:has-text("比例")'
   # --- Phong cách (image only) ---
-  style_button: 'button:has-text("Style"), button:has-text("Phong cách")'
+  style_button: 'button:has-text("Style"), button:has-text("Phong cách"), button:has-text("风格")'
   # --- Thời lượng video (nút hiển thị giá trị hiện tại: 5s hoặc 10s) ---
   duration_button: 'button:has-text("5s"), button:has-text("10s")'
 
@@ -124,6 +155,49 @@ models:
         select_text: "Dreamina Seedance 1.0"
         note: "Video đơn giản."
 
+  # --- Provider Doubao (豆包) — registry probe từ app TQ, UI tiếng Trung.
+  # Lưu ý: model Doubao tiêu thụ quota theo BỘ NHÂN (4x/3x/2x) — quota local
+  # đếm theo job nên estimate sẽ lạc quan hơn Cici.
+  doubao:
+    image:
+      default: seedream-4.5
+      options:
+        - alias: seedream-5-pro
+          name: "Seedream 5.0 Pro"
+          select_text: "Seedream 5.0 Pro"
+          note: "专业出图 — 4x quota."
+        - alias: seedream-5-lite
+          name: "Seedream 5.0 Lite"
+          select_text: "Seedream 5.0 Lite"
+          note: "进阶效果 — 3x quota."
+        - alias: seedream-4.5
+          name: "Seedream 4.5"
+          select_text: "Seedream 4.5"
+          note: "日常生成 — mặc định."
+        - alias: seedream-4.0
+          name: "Seedream 4.0"
+          select_text: "Seedream 4.0"
+          note: "基础生图."
+    video:
+      default: seedance-2.0-mini
+      options:
+        - alias: seedance-2.5
+          name: "Seedance 2.5"
+          select_text: "Seedance 2.5"
+          note: "旗舰视频标杆 — 5x quota."
+        - alias: seedance-2.0
+          name: "Seedance 2.0"
+          select_text: "Seedance 2.0"
+          note: "进阶画面表现 — 2x quota."
+        - alias: seedance-2.0-fast
+          name: "Seedance 2.0 Fast"
+          select_text: "Seedance 2.0 Fast"
+          note: "快速出片选择."
+        - alias: seedance-2.0-mini
+          name: "Seedance 2.0 Mini"
+          select_text: "Seedance 2.0 Mini"
+          note: "日常生成使用 — mặc định."
+
 # --------------------------------------------------------------------------- #
 # Generation options per kind (ratio / style / duration).
 # `alias` = giá trị API/CLI. `select_text` = substring khớp trong menuitem;
@@ -165,6 +239,64 @@ options:
     durations:
       - { alias: "5s",  select_text: "5s" }
       - { alias: "10s", select_text: "10s" }
+
+  # --- Provider Doubao — picker khác Cici: ratios/durations mở popover chứa
+  # BUTTON thường (không phải menuitem) — driver auto-detect và click theo tên
+  # exact. Duration không có picker riêng (gộp trong nút "自动 · 10s") —
+  # provider doubao KHÔNG hỗ trợ alias duration.
+  doubao:
+    image:
+      ratios:
+      - { alias: auto,   select_text: "自动" }
+      - { alias: "1:1",  select_text: "1:1" }
+      - { alias: "2:3",  select_text: "2:3" }
+      - { alias: "3:4",  select_text: "3:4" }
+      - { alias: "4:3",  select_text: "4:3" }
+      - { alias: "3:2",  select_text: "3:2" }
+      - { alias: "9:16", select_text: "9:16" }
+      - { alias: "16:9", select_text: "16:9" }
+      styles:
+      - { alias: portrait-photo,   select_text: "人像摄影" }
+      - { alias: cinematic,        select_text: "电影写真" }
+      - { alias: chinese-style,    select_text: "中国风" }
+      - { alias: anime,            select_text: "动漫" }
+      - { alias: 3d-render,        select_text: "3D渲染" }
+      - { alias: cyberpunk,        select_text: "赛博朋克" }
+      - { alias: cg-animation,     select_text: "CG 动画" }
+      - { alias: ink-wash,         select_text: "水墨画" }
+      - { alias: oil-painting,     select_text: "油画" }
+      - { alias: classical,        select_text: "古典" }
+      - { alias: watercolor,       select_text: "水彩画" }
+      - { alias: cartoon,          select_text: "卡通" }
+      - { alias: flat-illustration, select_text: "平面插画" }
+      - { alias: landscape,        select_text: "风景" }
+      - { alias: hk-anime,         select_text: "港风动漫" }
+      - { alias: pixel,            select_text: "像素风格" }
+      - { alias: neon-paint,       select_text: "荧光绘画" }
+      - { alias: colored-pencil,   select_text: "彩铅画" }
+      - { alias: figure-toy,       select_text: "手办" }
+      - { alias: children-drawing, select_text: "儿童绘画" }
+      - { alias: abstract,         select_text: "抽象" }
+      - { alias: pen-illustration, select_text: "锐笔插画" }
+      - { alias: nijigen,          select_text: "二次元" }
+      - { alias: ink-print,        select_text: "油墨印刷" }
+      - { alias: printmaking,      select_text: "版画" }
+      - { alias: monet,            select_text: "莫奈" }
+      - { alias: picasso,          select_text: "毕加索" }
+      - { alias: rembrandt,        select_text: "伦勃朗" }
+      - { alias: matisse,          select_text: "马蒂斯" }
+      - { alias: baroque,          select_text: "巴洛克" }
+      - { alias: retro-anime,      select_text: "复古动漫" }
+      - { alias: picture-book,     select_text: "绘本" }
+    video:
+      ratios:
+      - { alias: auto,   select_text: "自动" }
+      - { alias: "1:1",  select_text: "1:1" }
+      - { alias: "3:4",  select_text: "3:4" }
+      - { alias: "4:3",  select_text: "4:3" }
+      - { alias: "9:16", select_text: "9:16" }
+      - { alias: "16:9", select_text: "16:9" }
+      - { alias: "21:9", select_text: "21:9" }
 
 timing:
   # Polling interval (s) khi chờ kết quả

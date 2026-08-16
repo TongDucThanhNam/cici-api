@@ -115,36 +115,37 @@ def _quota_wait_then_retry(quota_info: dict | None, kind: str, attempt: int,
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _preflight(base: str, auto_launch: bool = True) -> bool:
-    """Đảm bảo core server + Cici sẵn sàng. Trả True nếu OK.
+def _preflight(base: str, auto_launch: bool = True, provider: str = "cici") -> bool:
+    """Đảm bảo core server + app của provider sẵn sàng. Trả True nếu OK.
 
-    Với auto_launch=True: nếu thiếu server/Cici → tự khởi động ngầm, rồi retry.
+    Với auto_launch=True: nếu thiếu server/app → tự khởi động ngầm, rồi retry.
     Với auto_launch=False: chỉ check, báo hướng dẫn nếu thiếu.
     """
     if auto_launch:
-        return _preflight_auto(base)
+        return _preflight_auto(base, provider)
     return _preflight_manual(base)
 
 
-def _preflight_auto(base: str) -> bool:
-    """Auto-launch Cici + spawn server nếu thiếu, rồi verify."""
-    # 1. Cici có CDP
-    if not _launcher._cdp_alive():
-        ok, msg = _launcher.ensure_cici(log=console.print)
+def _preflight_auto(base: str, provider: str = "cici") -> bool:
+    """Auto-launch app (Cici/Doubao) + spawn server nếu thiếu, rồi verify."""
+    label = {"cici": "Cici", "doubao": "Doubao"}.get(provider, provider)
+    # 1. App có CDP
+    if not _launcher._cdp_alive(_launcher._cdp_endpoint(provider)):
+        ok, msg = _launcher.ensure_app(provider, log=console.print)
         if not ok:
             out_console.print(Panel.fit(f"[red]{msg}[/]", title="[red]Preflight failed", border_style="red"))
             return False
         console.print(f"[green]✓ {msg}[/]")
     # 2. Login check
-    logged_in, detail = _launcher.check_login()
+    logged_in, detail = _launcher.check_login(provider)
     if not logged_in:
         out_console.print(
             Panel.fit(
-                f"[bold red]Cici chưa đăng nhập[/]\n{detail}\n\n"
+                f"[bold red]{label} chưa đăng nhập[/]\n{detail}\n\n"
                 "[bold]Cách khắc phục:[/]\n"
-                "  Mở cửa sổ Cici, đăng nhập account ByteDance của bạn,\n"
+                f"  Mở cửa sổ {label}, đăng nhập account ByteDance của bạn,\n"
                 "  rồi chạy lại lệnh này. Tool không thể tự login hộ bạn.",
-                title="[red]Cần đăng nhập Cici",
+                title=f"[red]Cần đăng nhập {label}",
                 border_style="red",
             )
         )
@@ -168,7 +169,7 @@ def _preflight_auto(base: str) -> bool:
     # 5. Peek quota — nếu đã cạn, in hint với ETA để user biết trước khi enqueue
     # (vẫn cho phép tiếp tục — không block; chỉ thông báo).
     try:
-        snap = api.quota(base=base, timeout=2.0)
+        snap = api.quota(base=base, timeout=2.0, provider=provider)
         for kind, info in snap.items():
             rmn = info.get("remaining")
             if rmn is not None and rmn == 0:
@@ -244,15 +245,19 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
                     ratio: str | None = None, style: str | None = None,
                     duration: str | None = None,
                     quota_wait: bool = False, quota_max_wait: float | None = None,
-                    account: str | None = None) -> int:
+                    account: str | None = None,
+                    provider: str = "cici") -> int:
     """Luồng chung cho image/video: preflight -> generate -> wait -> render.
+
+    provider = "cici" (mặc định) hoặc "doubao" — app/CDP endpoint + registry
+    + quota state riêng của provider đó.
 
     quota_wait=True: khi bị quota chặn (429 lúc enqueue hoặc QUOTA_EXHAUSTED
     giữa job), thay vì exit 4 ngay thì chờ tới khi slot cũ nhất roll ra rolling
     window (daily cap) hoặc vài phút (burst), rồi tự re-enqueue. Bounded bởi
     --quota-max-wait + quota.max_attempts — vượt giới hạn thì exit 4 như cũ.
     """
-    if not _preflight(base, auto_launch=auto_launch):
+    if not _preflight(base, auto_launch=auto_launch, provider=provider):
         return api.EXIT_PREFLIGHT
 
     if quota_wait:
@@ -280,7 +285,7 @@ def _run_generation(prompt: str, kind: str, as_json: bool, base: str,
         try:
             resp = api.generate(prompt, kind, base=base, model=model, references=references,
                                 ratio=ratio, style=style, duration=duration,
-                                account=account)
+                                account=account, provider=provider)
         except api.QuotaExhausted as e:
             # server refuse vì local quota estimate = 0 (đừng lãng phí thời gian gen)
             quota_snap = e.detail.get("quota") if isinstance(e.detail, dict) else None
@@ -670,11 +675,14 @@ def doctor(ctx: click.Context, as_json: bool):
               help="Tổng giây chờ quota tối đa khi --wait-for-quota (mặc định từ config quota.max_wait_seconds).")
 @click.option("--account", "account", default=None,
               help="Nhãn tách quota local theo account (bạn TỰ đổi account trong app Cici — tool không tự đổi).")
+@click.option("--provider", "provider",
+              type=click.Choice(["cici", "doubao"]), default="cici",
+              help="App để gen: cici (Dola, mặc định) hoặc doubao (豆包 — bản TQ, quota riêng).")
 @click.pass_context
 def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, ...],
           ratio: str | None, style: str | None, as_json: bool,
           quota_wait: bool, quota_max_wait: float | None,
-          account: str | None):
+          account: str | None, provider: str):
     """Sinh ảnh từ PROMPT (block tới xong, ~2-3 phút).
 
     Model mặc định: seedream-5-pro. Đổi bằng -m/--model (xem `cici models`).
@@ -693,7 +701,7 @@ def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, .
                              references=ref_list or None,
                              ratio=ratio, style=style,
                              quota_wait=quota_wait, quota_max_wait=quota_max_wait,
-                             account=account))
+                             account=account, provider=provider))
 
 
 @main.command()
@@ -711,11 +719,14 @@ def image(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, .
               help="Tổng giây chờ quota tối đa khi --wait-for-quota (mặc định từ config quota.max_wait_seconds).")
 @click.option("--account", "account", default=None,
               help="Nhãn tách quota local theo account (bạn TỰ đổi account trong app Cici — tool không tự đổi).")
+@click.option("--provider", "provider",
+              type=click.Choice(["cici", "doubao"]), default="cici",
+              help="App để gen: cici (Dola, mặc định) hoặc doubao (豆包 — bản TQ, quota riêng).")
 @click.pass_context
 def video(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, ...],
           ratio: str | None, duration: str | None, as_json: bool,
           quota_wait: bool, quota_max_wait: float | None,
-          account: str | None):
+          account: str | None, provider: str):
     """Sinh video từ PROMPT (block tới xong).
 
     Model mặc định: seedance-2.5. Hỗ trợ image-to-video: truyền ảnh bằng --ref.
@@ -732,15 +743,18 @@ def video(ctx: click.Context, prompt: str, model: str | None, refs: tuple[str, .
                              references=ref_list or None,
                              ratio=ratio, duration=duration,
                              quota_wait=quota_wait, quota_max_wait=quota_max_wait,
-                             account=account))
+                             account=account, provider=provider))
 
 
 @main.command()
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
 @click.option("--account", "account", default=None,
               help="Xem quota riêng của 1 nhãn account (state ~/.cici/quota-<nhãn>.json).")
+@click.option("--provider", "provider",
+              type=click.Choice(["cici", "doubao"]), default="cici",
+              help="Xem quota của provider (mặc định cici).")
 @click.pass_context
-def quota(ctx: click.Context, as_json: bool, account: str | None):
+def quota(ctx: click.Context, as_json: bool, account: str | None, provider: str):
     """Xem quota còn lại (rolling 24h local estimate + threshold đã học).
 
     --account <nhãn> để xem quota riêng của nhãn đó. Bạn tự đổi account trong
@@ -748,7 +762,7 @@ def quota(ctx: click.Context, as_json: bool, account: str | None):
     """
     base = ctx.obj["base"]
     try:
-        snap = api.quota(base=base, account=account)
+        snap = api.quota(base=base, account=account, provider=provider)
     except api.CiciUnreachable as e:
         if as_json:
             _emit_json({"status": "unreachable", "error": str(e)})
@@ -801,13 +815,16 @@ def quota(ctx: click.Context, as_json: bool, account: str | None):
 @main.command()
 @click.option("--type", "kind", type=click.Choice(["image", "video"]),
               default=None, help="Lọc theo loại (image/video).")
+@click.option("--provider", "provider",
+              type=click.Choice(["cici", "doubao"]), default="cici",
+              help="Registry của provider (mặc định cici; doubao = model TQ).")
 @click.option("--json", "as_json", is_flag=True, help="Xuất JSON thay vì text màu.")
 @click.pass_context
-def models(ctx: click.Context, kind: str | None, as_json: bool):
+def models(ctx: click.Context, kind: str | None, provider: str, as_json: bool):
     """List các model khả dụng + generation options (ratio/style/duration)."""
     base = ctx.obj["base"]
     try:
-        registry = api.models(base=base)
+        registry = api.models(base=base, provider=provider)
     except api.CiciUnreachable as e:
         # fallback: nếu server down, vẫn không list được (registry nằm trong core config)
         if as_json:

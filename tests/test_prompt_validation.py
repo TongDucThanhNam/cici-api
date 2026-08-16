@@ -104,7 +104,7 @@ def main() -> int:
     captured = {}
 
     def fake_generate(prompt, kind, base, timeout=10.0, model=None, references=None,
-                      ratio=None, style=None, duration=None, account=None):
+                      ratio=None, style=None, duration=None, account=None, provider="cici"):
         captured["prompt"] = prompt
         return {"job_id": "mock-job", "timeout_s": 1}
 
@@ -112,7 +112,7 @@ def main() -> int:
         return {"status": "COMPLETED", "result_urls": []}
 
     _orig = (cli._preflight, _client.generate, _client.wait_status, cli._emit_json)
-    cli._preflight = lambda base, auto_launch=True: True
+    cli._preflight = lambda base, auto_launch=True, provider="cici": True
     _client.generate = fake_generate
     _client.wait_status = fake_wait
 

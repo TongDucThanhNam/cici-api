@@ -111,22 +111,34 @@ def sanitize_account(account: str | None) -> str | None:
     return slug[:32]
 
 
-def state_path(account: str | None, base: Path = DEFAULT_STATE_PATH) -> Path:
-    """File state cho account: None → quota.json; có label → quota-<slug>.json."""
+def state_path(account: str | None, base: Path = DEFAULT_STATE_PATH,
+               provider: str = "cici") -> Path:
+    """File state cho account/provider.
+
+    provider "cici" giữ tên legacy (quota.json / quota-<slug>.json — compat
+    với state sẵn có). Provider khác namespace riêng: quota-<provider>.json /
+    quota-<provider>-<slug>.json (quota Doubao tách hẳn khỏi Cici).
+    """
     acct = sanitize_account(account)
+    if provider == "cici":
+        if acct is None:
+            return base
+        return base.with_name(f"quota-{acct}.json")
     if acct is None:
-        return base
-    return base.with_name(f"quota-{acct}.json")
+        return base.with_name(f"quota-{provider}.json")
+    return base.with_name(f"quota-{provider}-{acct}.json")
 
 
-def load_account(account: str | None, path: Path = DEFAULT_STATE_PATH) -> QuotaState:
+def load_account(account: str | None, path: Path = DEFAULT_STATE_PATH,
+                 provider: str = "cici") -> QuotaState:
     """Load state của 1 account (None → legacy quota.json)."""
-    return load(state_path(account, path))
+    return load(state_path(account, path, provider))
 
 
 def save_account(state: QuotaState, account: str | None,
-                 path: Path = DEFAULT_STATE_PATH) -> None:
-    save(state, state_path(account, path))
+                 path: Path = DEFAULT_STATE_PATH,
+                 provider: str = "cici") -> None:
+    save(state, state_path(account, path, provider))
 
 
 # --------------------------------------------------------------------------- #

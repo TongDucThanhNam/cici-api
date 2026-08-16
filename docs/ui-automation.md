@@ -23,6 +23,20 @@ Driver entry point is the dedicated creation page **"Tác phẩm của AI"**
 (`chrome://dola-chat/chat/create-image`, `cdp.create_image_url`), verified on
 Dola build **Chrome/147.0.7727.149**:
 
+**Doubao (豆包) provider** — the Chinese sibling of the same app (same Chromium
+build, mirrored URLs `chrome://doubao-chat/chat/create-image`, identical
+`data-testid`s incl. creation tabs, reference button, TiPTap editor). Probed
+2026-08: toolbar 模型/比例/风格, models Seedream 5.0 Pro / 5.0 Lite / 4.5 / 4.0
+(image, quota multipliers 4x/3x) and Seedance 2.5 / 2.0 / Fast / Mini (video),
+32 Chinese styles, ratios include 自动 (`auto`) + `3:2` (image) / `21:9`
+(video). Two Doubao-specific behaviors: (1) the app must be launched via the
+stub `Application/Doubao.exe` — launching `app/Doubao.exe` directly ignores
+`--remote-debugging-port`; (2) the ratio/duration picker renders plain
+`button`s (no `role="menuitem"`), so `_select_dropdown` falls back to clicking
+by exact accessible name (`_has_text(..., exact=True)` anchors the regex). No
+duration picker exists (merged into the ratio button label) — `--duration` is
+rejected server-side for `provider=doubao`.
+
 - Tabs `creation-skill-switch-tab-image` / `-video` switch modality. Both tabs
   share the same reference button (`image-creation-chat-input-picture-reference-button`),
   which opens a native file chooser.

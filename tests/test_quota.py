@@ -338,7 +338,7 @@ def main() -> int:
         calls["sleep"] += 1
 
     _orig = (_cli_mod._preflight, _client.generate, _client.wait_status, _cli_mod._quota_sleep)
-    _cli_mod._preflight = lambda base, auto_launch=True: True
+    _cli_mod._preflight = lambda base, auto_launch=True, provider="cici": True
     _client.generate = fake_generate
     _client.wait_status = fake_wait
     _cli_mod._quota_sleep = fake_sleep
@@ -369,7 +369,7 @@ def main() -> int:
         calls2["sleep"] += 1
 
     _orig2 = (_cli_mod._preflight, _client.generate, _client.wait_status, _cli_mod._quota_sleep)
-    _cli_mod._preflight = lambda base, auto_launch=True: True
+    _cli_mod._preflight = lambda base, auto_launch=True, provider="cici": True
     _client.generate = fake_generate_always
     _client.wait_status = fake_wait
     _cli_mod._quota_sleep = fake_sleep2

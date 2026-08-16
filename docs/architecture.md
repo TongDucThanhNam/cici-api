@@ -32,22 +32,40 @@ signed-in browser session and must not be exposed to an untrusted network.
 
 ## Request and job flow
 
-1. `POST /api/generate` validates the prompt, type, optional model, references,
-   ratio/style/duration options, and the local quota estimate.
+1. `POST /api/generate` validates the prompt, type, optional provider
+   (`cici` default | `doubao`), optional model, references, ratio/style/duration
+   options (against that provider's registry), and the local quota estimate
+   (per provider + account).
 2. The API stores `PENDING`, places a `Job` on `JOB_QUEUE`, and immediately
    returns HTTP 202 with the job ID.
 3. The one worker changes the state to `PROCESSING` and calls
    `CiciDriver.execute`.
-4. The driver navigates to the create-image page and clicks the image/video tab
-   (build 147.0.7727.149+; legacy skill-bar flow as fallback), always selects
-   the model, optionally selects ratio/style/duration, optionally uploads image
-   references (image and video — image-to-video), sends the prompt, and polls
-   for the result.
+4. The driver switches CDP endpoint when the job's provider differs from the
+   attached one (Cici 9222 / Doubao 9223 — `cdp.providers.<name>` overlay;
+   disconnect only, never kills the app), then navigates to the create-image
+   page and clicks the image/video tab (build 147.0.7727.149+; legacy skill-bar
+   flow as fallback), always selects the model, optionally selects
+   ratio/style/duration, optionally uploads image references (image and video —
+   image-to-video), sends the prompt, and polls for the result.
 5. The store ends in `COMPLETED` (with `result_urls[]`), `FAILED`,
    `QUOTA_EXHAUSTED`, or `CONTENT_BLOCKED`. Clients poll
    `GET /api/status/{job_id}` for the result; `cici/_client.wait_status`
    treats all four as terminal so the CLI reports the right exit code
    immediately instead of polling to timeout.
+
+### Providers
+
+Both apps are the same ByteDance codebase (Chromium 147.0.7727.149) with
+mirrored URLs (`chrome://dola-chat/...` vs `chrome://doubao-chat/...`) and the
+same `data-testid`s. Provider differences live in `config.yaml`:
+`providers.<name>` (exe path/env, CDP port, chat host), `cdp.providers.<name>`
+(URL overlay), and per-provider registries under `models.<provider>` /
+`options.<provider>` (legacy flat keys remain the `cici` registry). Quota state
+is namespaced per provider (`~/.cici/quota-doubao*.json`; cici keeps legacy
+`quota*.json` names). Doubao quirks: it must be launched via the stub
+`Application/Doubao.exe` for the CDP flag to be forwarded, and its ratio picker
+renders plain buttons (not `role="menuitem"`) — `_select_dropdown`
+auto-detects this and clicks by exact accessible name.
 
 `JobStore` is process-local in memory, but the server wraps it in a
 persistent subclass: every update is written through to `~/.cici/jobs.json`

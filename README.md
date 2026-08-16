@@ -28,12 +28,13 @@
 ## Tính năng
 
 - **1 lệnh là xong**: `cici image "prompt"` — tự khởi động Cici (có CDP) + server nếu thiếu, block tới khi có kết quả.
+- **2 provider**: Cici (Dola — mặc định) và **Doubao (豆包 — bản TQ cùng codebase)**: `--provider doubao`. Registry model + quota riêng, Seedream 5.0 Pro/5.0 Lite có ở Doubao, CDP song song 2 app (9222/9223).
 - **Cho AI agent**: `--json` stdout sạch, exit codes chuẩn hoá (0/1/2/3/4), timeout đồng bộ từ server.
 - **Ảnh gốc full-size** — tự nâng từ preview ~288px lên bản gốc (vd 1773×2364) qua image viewer.
 - **Image + Video**: model Seedream/Seedance, ratio, style, duration, ảnh tham chiếu (image-to-video).
 - **Queue an toàn** — single-consumer, N agent gọi đồng thời vẫn xếp hàng đúng, `queue_ahead` minh bạch.
 - **Job persistence** — state ghi xuống `~/.cici/jobs.json`; restart server giữa job thì job in-flight bị đánh FAILED (kèm lỗi rõ ràng) thay vì biến mất, job đã xong vẫn tra cứu được sau restart (retention 7 ngày).
-- **Quota tracking** — đếm rolling 24h local, auto-learn threshold, hết quota thì fail nhanh (exit 4); `--wait-for-quota` tự chờ + retry khi slot roll ra window.
+- **Quota tracking** — đếm rolling 24h local theo account + provider, auto-learn threshold, hết quota thì fail nhanh (exit 4); `--wait-for-quota` tự chờ + retry khi slot roll ra window.
 - **`cici doctor`** — check toàn bộ prerequisites trong 1 lệnh.
 - **Self-contained package** — `pipx install` là chạy được, không cần giữ folder repo.
 
@@ -69,6 +70,7 @@ cici image "mèo orange dễ thương, phong cách chibi" --json
 |---|---|
 | Python | ≥ 3.10 (đã test 3.14) |
 | App Cici | [Dola Browser / Cici](https://www.ciciai.com/) đã cài + đăng nhập |
+| App Doubao *(tuỳ chọn)* | [Doubao](https://www.doubao.com/chat/) đã cài + đăng nhập — chỉ cần khi dùng `--provider doubao` |
 | Ngôn ngữ UI Cici | **Tiếng Việt hoặc English** — selector của tool khớp theo 2 locale này; ngôn ngữ khác làm chọn model/ratio/style fail (xem [Giới hạn đã biết](#giới-hạn-đã-biết)) |
 | OS | Windows: đầy đủ tính năng (auto-launch Cici + server). macOS/Linux: tự chạy server được, còn Cici phải mở thủ công với `--remote-debugging-port=9222` |
 
@@ -150,6 +152,7 @@ cici image "..." --style watercolor           # phong cách
 cici image "..." --ref a.png --ref b.png      # ảnh tham chiếu (lặp lại, hoặc phẩy: --ref a.png,b.png; tối đa 10)
 cici image "..." --wait-for-quota             # hết quota → tự chờ + retry (xem phần Quota tracking)
 cici image "..." --json                       # stdout JSON cho agent
+cici image "..." --provider doubao            # gen qua Doubao (豆包) — registry + quota riêng
 ```
 
 ### Gen video
@@ -158,10 +161,28 @@ cici image "..." --json                       # stdout JSON cho agent
 cici video "thuyền buồm trên biển lúc hoàng hôn"
 cici video "..." -m seedance-2-fast           # model nhanh
 cici video "..." --ratio 9:16
-cici video "..." --duration 5s                # 5s / 10s
+cici video "..." --duration 5s                # 5s / 10s (Cici only — Doubao không có picker duration)
 cici video "..." --ref a.png                  # image-to-video: ảnh = frame đầu
 cici video "..." --wait-for-quota             # hết quota → tự chờ + retry (xem phần Quota tracking)
+cici video "..." --provider doubao            # Seedance 2.5 / 2.0 / Fast / Mini
 ```
+
+### Provider Doubao (豆包)
+
+Doubao là bản TQ của cùng app (cùng codebase Chromium 147.0.7727.149) — cần
+app [Doubao](https://www.doubao.com/chat/) cài + đăng nhập account ByteDance TQ.
+Thêm `--provider doubao` vào `cici image/video` (hoặc `"provider": "doubao"`
+trong payload API):
+
+- CLI tự launch Doubao với CDP port riêng (**9223**) — chạy song song với Cici (9222).
+- Registry riêng: image `seedream-5-pro / seedream-5-lite / seedream-4.5 / seedream-4.0`
+  (mặc định `seedream-4.5` — model Doubao tiêu thụ quota theo **bộ nhân 4x/3x**,
+  local estimate sẽ lạc quan hơn Cici), video `seedance-2.5 / 2.0 / 2.0-fast / 2.0-mini`.
+- Styles tiếng Trung (32 style: `anime`, `cyberpunk`, `monet`, `picasso`…), ratios
+  có thêm `auto` + `3:2` (image) / `21:9` (video). Xem đầy đủ: `cici models --provider doubao`.
+- Quota state tách file riêng (`~/.cici/quota-doubao*.json`) — không dính quota Cici.
+- Lưu ý launch: Doubao phải khởi động qua stub exe ở gốc `Application/Doubao.exe`
+  (đã encode trong config) — launch exe trong `app/` sẽ bị lờ flag CDP.
 
 ### Models
 
@@ -258,6 +279,7 @@ Payload đầy đủ (ngoài `prompt` đều optional):
 {
   "prompt": "…",
   "type": "image | video",
+  "provider": "cici | doubao",
   "model": "seedream-4.5",
   "references": ["C:/path/a.png", "C:/path/b.png"],
   "ratio": "16:9",
@@ -269,6 +291,8 @@ Payload đầy đủ (ngoài `prompt` đều optional):
 
 - `prompt` — bắt buộc, không giới hạn độ dài (prompt rất dài sẽ tốn thời gian
   typing vào Cici và tính vào timeout gen).
+- `provider` — `cici` (mặc định, omit được) hoặc `doubao`. Alias model/ratio/style
+  validate theo registry của provider đó (xem `GET /api/models?provider=doubao`).
 - `references` — đường dẫn local, tối đa 10, hỗ trợ cả **video** (image-to-video).
 - `style` chỉ dùng cho image; `duration` chỉ cho video.
 - `account` — nhãn tuỳ chọn để tách quota local theo account (bạn tự đổi account
@@ -383,7 +407,11 @@ timing:
   (Nhật/Trung/Hàn…) → job fail ở bước chọn model/ratio/style (`Locator.click:
   Timeout`). Fix: đổi ngôn ngữ app Cici về VI/EN, hoặc thêm nhãn ngôn ngữ đó
   vào `selectors` + `select_text` trong `config.yaml` (lấy text chính xác qua
-  `python inspect_dom.py`).
+  `python inspect_dom.py`). Riêng **Doubao thì UI tiếng Trung là mặc định và
+  đã hỗ trợ sẵn** (selector tam ngữ VI/EN/ZH).
+- **Doubao: không có `--duration`** — video tab Doubao gộp duration trong nút
+  ratio ("自动 · 10s"), không có picker riêng; model Doubao tiêu thụ quota theo
+  bộ nhân (4x/3x/2x) nên quota estimate local lạc quan hơn Cici.
 - **Tốc độ** — tuần tự ~2 phút/job ảnh; không phù hợp throughput cao.
 - **Quota** — dùng quota free của account Cici; rate-limit / block có thể xảy ra bất cứ lúc nào.
 - **UI Cici cập nhật** = phải re-inspect config (xem [Xử lý sự cố](#xử-lý-sự-cố)).

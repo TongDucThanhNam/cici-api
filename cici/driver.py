@@ -88,6 +88,7 @@ class Job:
     style: str | None = None       # alias options.image.styles[].alias (image only)
     duration: str | None = None    # alias options.video.durations[].alias (video only, "5s"/"10s")
     account: str | None = None     # nhãn tách quota local (user TỰ đổi account trong app — tool không tự đổi)
+    provider: str = "cici"         # "cici" | "doubao" — app/CDP endpoint + registry riêng
     created_at: float = field(default_factory=time.time)
 
 
@@ -242,11 +243,36 @@ class CiciDriver:
         self._browser: Optional[Browser] = None
         self._page: Optional[Page] = None
         self._lock = asyncio.Lock()  # serialize all UI ops
+        # provider của connection hiện tại — đổi provider giữa 2 job thì phải
+        # detach CDP cũ rồi attach lại endpoint mới (queue tuần tự nên an toàn)
+        self._current_provider: str = "cici"
         # refusal patterns: Cici từ chối kết quả (bản quyền / content policy).
         # Load từ config; fallback default nếu thiếu.
         self.refusal_patterns: list[str] = (
             cfg.get("messages", {}).get("refusal_patterns") or _DEFAULT_REFUSAL_PATTERNS
         )
+
+    # ---- provider resolution -------------------------------------------- #
+    def _cdp_for(self, provider: str) -> dict:
+        """Section cdp cho provider: base + overlay cdp.providers.<name>."""
+        cdp = dict(self.cfg.get("cdp", {}))
+        overlay = (self.cfg.get("cdp", {}).get("providers") or {}).get(provider)
+        if overlay:
+            cdp.update(overlay)
+        return cdp
+
+    def _registry(self, section: str, provider: str) -> dict:
+        """models/options cho provider.
+
+        Section legacy (flat theo kind) = registry của "cici" — phải loại các
+        key provider (models.doubao...) khỏi view này. Provider khác nằm ở key
+        trùng tên provider trong cùng section (models.doubao, ...).
+        """
+        data = self.cfg.get(section, {})
+        prov_names = set(self.cfg.get("providers", {}) or {})
+        if provider in data:
+            return data[provider]
+        return {k: v for k, v in data.items() if k not in prov_names}
 
     def _is_refusal_message(self, text: str) -> bool:
         """Cici từ chối hiển thị kết quả (bản quyền / content policy)?
@@ -272,7 +298,7 @@ class CiciDriver:
         Mặc định dùng `cdp.connect_timeout` từ config.
         """
         await self.connect()
-        cdp = self.cfg["cdp"]
+        cdp = self._cdp_for(self._current_provider)
         budget = timeout if timeout is not None else cdp.get("connect_timeout", 90)
         deadline = time.monotonic() + budget
         delay = cdp["reconnect_initial_delay"]
@@ -297,12 +323,29 @@ class CiciDriver:
             except Exception as e:  # noqa: BLE001
                 if time.monotonic() >= deadline:
                     raise ConnectionError(
-                        f"Cici CDP ({cdp['endpoint']}) không nối được sau {budget:.0f}s: {e}. "
-                        "Kiểm tra Cici đang chạy với --remote-debugging-port=9222 (start_cici.bat)."
+                        f"{self._current_provider} CDP ({cdp['endpoint']}) không nối được "
+                        f"sau {budget:.0f}s: {e}. Kiểm tra app đang chạy với đúng "
+                        "--remote-debugging-port (xem providers trong config.yaml)."
                     ) from e
                 log.warning("CDP connect failed (%s); retry in %ss", e, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, mx)
+
+    async def _switch_provider(self, provider: str) -> None:
+        """Đổi provider nếu khác connection hiện tại: detach CDP cũ (không kill
+        app — connect_over_cdp close() chỉ ngắt kết nối), job sau attach mới."""
+        if provider == self._current_provider:
+            return
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:  # noqa: BLE001 — best-effort detach
+                pass
+        self._browser = None
+        self._page = None
+        self._current_provider = provider
+        log.info("Switched provider -> %s (CDP %s)", provider,
+                 self._cdp_for(provider).get("endpoint"))
 
     async def _ensure_page(self) -> Page:
         if self._page is None:
@@ -357,7 +400,7 @@ class CiciDriver:
         → caller fallback legacy flow.
         """
         page = await self._ensure_page()
-        url = self.cfg["cdp"]["create_image_url"]
+        url = self._cdp_for(self._current_provider)["create_image_url"]
         if page.url != url:
             await page.goto(url, wait_until="domcontentloaded")
             await asyncio.sleep(self.tm["ui_step_delay"])
@@ -375,8 +418,9 @@ class CiciDriver:
         await asyncio.sleep(self.tm.get("tab_delay", self.tm["ui_step_delay"]))
 
     def _resolve_model(self, kind: str, alias: str | None) -> dict:
-        """Look up model option in cfg['models'][kind]. Alias None → default."""
-        registry = self.cfg.get("models", {}).get(kind, {})
+        """Look up model option trong registry của provider hiện tại.
+        Alias None → default."""
+        registry = self._registry("models", self._current_provider).get(kind, {})
         if not alias:
             alias = registry.get("default")
         for opt in registry.get("options", []):
@@ -388,8 +432,10 @@ class CiciDriver:
         )
 
     def _resolve_option(self, kind: str, group: str, alias: str) -> dict:
-        """Look up an option in cfg['options'][kind][group] (ratios/styles/durations)."""
-        opts = self.cfg.get("options", {}).get(kind, {}).get(group, [])
+        """Look up an option in registry của provider hiện tại
+        (cfg['options'][<kind>][<group>] theo provider)."""
+        opts = (self._registry("options", self._current_provider)
+                .get(kind, {}).get(group, []))
         for o in opts:
             if o["alias"] == alias:
                 return o
@@ -399,11 +445,18 @@ class CiciDriver:
         )
 
     @staticmethod
-    def _has_text(select_text: str | list[str]):
+    def _has_text(select_text: str | list[str], exact: bool = False):
         """select_text là string, hoặc list chuỗi đa ngôn ngữ (UI Cici có
-        locale VI/EN) — list → regex khớp bất kỳ chuỗi nào."""
+        locale VI/EN/ZH) — list → regex khớp bất kỳ chuỗi nào.
+
+        exact=True neo ^$ để dùng làm accessible-name (get_by_role name=...)
+        — tránh "16:9" khớp nhầm nút toolbar "比例 16:9".
+        """
         if isinstance(select_text, list):
-            return re.compile("|".join(re.escape(t) for t in select_text))
+            pat = "|".join(re.escape(t) for t in select_text)
+            return re.compile(f"^(?:{pat})$") if exact else re.compile(pat)
+        if exact:
+            return re.compile(f"^{re.escape(select_text)}$")
         return select_text
 
     async def _select_model(self, kind: str, alias: str | None) -> None:
@@ -429,8 +482,15 @@ class CiciDriver:
             button_sel
         ).first.click()
         await asyncio.sleep(self.tm.get("dropdown_delay", 0.6))
-        await page.locator(self.sel["model_option"],
-                           has_text=self._has_text(opt["select_text"])).first.click()
+        # Option click: Cici dùng Radix menuitem; Doubao ratio/duration mở
+        # popover chứa BUTTON thường — auto-detect: không có menuitem thì click
+        # button theo accessible-name exact (neo ^$ tránh trúng nút toolbar).
+        opt_loc = page.locator(self.sel["model_option"],
+                               has_text=self._has_text(opt["select_text"]))
+        if await opt_loc.count() == 0:
+            opt_loc = page.get_by_role(
+                "button", name=self._has_text(opt["select_text"], exact=True))
+        await opt_loc.first.click()
         await asyncio.sleep(self.tm["ui_step_delay"])
 
     async def _upload_references(self, paths: list[str]) -> None:
@@ -667,6 +727,8 @@ class CiciDriver:
             timeout = (
                 self.tm["image_timeout"] if job.kind == "image" else self.tm["video_timeout"]
             )
+            # provider quyết định CDP endpoint + registry — đổi app thì detach cũ
+            await self._switch_provider(job.provider)
             try:
                 # Entry chính: trang create-image (build .149+). Fallback legacy
                 # skill flow cho build cũ (skill bar trong conversation).
@@ -694,34 +756,35 @@ class CiciDriver:
                 # ảnh: nâng lên bản gốc full-size (viewer lazy-load) — best-effort
                 if job.kind == "image":
                     urls = await self._upgrade_to_fullsize(urls, bot_count_before)
-                # success → record quota (theo account label nếu có)
+                # success → record quota (theo account label + provider nếu có)
                 if _quota:
-                    state = _quota.load_account(job.account)
+                    state = _quota.load_account(job.account, provider=job.provider)
                     _quota.record_success(state, job.kind)
-                    _quota.save_account(state, job.account)
+                    _quota.save_account(state, job.account, provider=job.provider)
                 result: dict[str, Any] = {
                     "status": "COMPLETED",
                     "result_urls": urls,
                     "kind": job.kind,
-                    "model": job.model or self.cfg["models"][job.kind]["default"],
+                    "model": job.model or self._registry("models", job.provider)[job.kind]["default"],
                 }
                 for k in ("ratio", "style", "duration"):
                     if getattr(job, k):
                         result[k] = getattr(job, k)
                 return result
             except QuotaExhausted as e:
-                # quota hết → record limit-hit (auto-learn threshold, theo account)
+                # quota hết → record limit-hit (auto-learn threshold, theo
+                # account + provider)
                 if _quota:
-                    state = _quota.load_account(job.account)
+                    state = _quota.load_account(job.account, provider=job.provider)
                     thr = _quota.record_limit_hit(state, job.kind)
-                    _quota.save_account(state, job.account)
+                    _quota.save_account(state, job.account, provider=job.provider)
                     log.warning("Job %s QUOTA EXHAUSTED (kind=%s, learned threshold=%s)",
                                 job.job_id, job.kind, thr)
                 return {
                     "status": "QUOTA_EXHAUSTED",
                     "kind": job.kind,
                     "message": e.raw_message,
-                    "quota": _quota.snapshot(_quota.load_account(job.account), job.kind) if _quota else None,
+                    "quota": _quota.snapshot(_quota.load_account(job.account, provider=job.provider), job.kind) if _quota else None,
                 }
             except ContentBlocked as e:
                 # Cici gen xong nhưng từ chối hiển thị kết quả (bản quyền / policy).
