@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+id: single-consumer-worker-count
+language: Yaml
+severity: error
+message: concurrency.worker_count must remain 1.
+note: Cici exposes one chat surface, so multiple browser consumers race on shared UI state.
+rule:
+  pattern:
+    context: "worker_count: $COUNT"
+    selector: block_mapping_pair
+constraints:
+  COUNT:
+    regex: "^(?:0|[2-9][0-9]*|-[0-9]+)$"

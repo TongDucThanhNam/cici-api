@@ -262,12 +262,143 @@ def main() -> int:
         assert out[0] == FULL_A and out[1] == "preview-missing", out
         passed += 1
         print("PASS 11: full-size marker map (base -> image_pre_watermark URL)")
+
+        # 12. Doubao video: KHÔNG action bar trên video message → done fallback
+        # theo text (video_done_patterns) + <video> src có sẵn (hover-init).
+        # Verify live 2026-08-22: Doubao video message text "你的视频生成好了".
+        sel_doubao = dict(SEL, video_done_patterns=["视频生成好", "video is ready"])
+        page.set_content(
+            CHAT_PAGE.format(
+                old=bot_msg(done=True, text="old"),
+                new=(
+                    '<div data-testid="receive_message">生成视频：a cat，10s\n你的视频生成好了。'
+                    '<div class="block-video-Db"><div class="video-player-Db">'
+                    f'<video src="{VIDEO1}"></video></div></div>'
+                    "</div>"
+                ),
+            )
+        )
+        res = page.evaluate(
+            _POLL_RESULT_JS,
+            {"sel": sel_doubao, "before": 1, "mediaBefore": [], "kind": "video"},
+        )
+        assert res["done"] is True and res["urls"] == [VIDEO1], res
+        # không có patterns → không done (giữ hành vi cũ khi config thiếu)
+        res_nopat = page.evaluate(
+            _POLL_RESULT_JS,
+            {"sel": SEL, "before": 1, "mediaBefore": [], "kind": "video"},
+        )
+        assert res_nopat["done"] is False and res_nopat["urls"] == [VIDEO1], res_nopat
+        # pattern xuất hiện nhưng CHƯA có video src → vẫn chưa done (contract)
+        page.set_content(
+            CHAT_PAGE.format(
+                old=bot_msg(done=True, text="old"),
+                new=(
+                    '<div data-testid="receive_message">你的视频生成好了。'
+                    '<div class="block-video-Db"><img class="cover-x" src="c.png"></div>'
+                    "</div>"
+                ),
+            )
+        )
+        res_novideo = page.evaluate(
+            _POLL_RESULT_JS,
+            {"sel": sel_doubao, "before": 1, "mediaBefore": [], "kind": "video"},
+        )
+        assert res_novideo["done"] is False, res_novideo
+        passed += 1
+        print("PASS 12: Doubao video done-fallback via text pattern (no action bar)")
+
+        # 13. Confirm-request: bot hỏi "Reply 'confirm'..." thay vì gen →
+        # _is_confirm_request nhận ra (straight + curly quotes), poll trả
+        # lastText để driver chỉ soi message CUỐI.
+        cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+        driver = CiciDriver(load_config(str(cfg_path)))
+        curly = ("I\u2019ll generate a stable locked-camera time-lapse. "
+                 "Please confirm these parameters:\n- Duration: 10 seconds\n"
+                 "Reply \u201cconfirm\u201d and I\u2019ll generate it directly.")
+        assert driver._is_confirm_request(curly) is True, curly
+        assert driver._is_confirm_request(
+            'Reply "confirm" and I\'ll generate it directly.') is True
+        assert driver._is_confirm_request("Hãy xác nhận để tôi tạo video.") is True
+        # verify live 2026-08-22: Dola hỏi A/B/C duration + "reply “Generate”"
+        generate_ask = (
+            "I\u2019ll generate a stable locked-camera time-lapse. "
+            "Video generation currently supports durations from 4 to 15 "
+            "seconds. The default is 5 seconds. Do you want me to use:\n\n"
+            "A. 5 seconds\nB. 10 seconds\nC. 15 seconds\n\n"
+            "Or just reply \u201cGenerate\u201d and I\u2019ll make a 5-second "
+            "version directly.")
+        assert driver._is_confirm_request(generate_ask) is True, generate_ask
+        # negative: text gen xong / refusal KHÔNG bị flag là confirm-request
+        assert driver._is_confirm_request("Your video is ready.") is False
+        assert driver._is_confirm_request(refusal) is False
+        assert driver._is_confirm_request("") is False
+        # "reply" trong văn xuôi (không nháy token) → không phải confirm-request
+        assert driver._is_confirm_request(
+            "I will reply to your request with the video shortly.") is False
+        # poll trả lastText = text của bot message MỚI CUỐI (không phải gộp)
+        ask = bot_msg(done=False, text="Reply \u201cconfirm\u201d and I\u2019ll generate it.")
+        ok_msg = bot_msg(videos=[], done=False, text="Great, generating now.")
+        page.set_content(CHAT_PAGE.format(old="", new=ask + ok_msg))
+        res = page.evaluate(
+            _POLL_RESULT_JS,
+            {"sel": SEL, "before": 0, "mediaBefore": [], "kind": "video"},
+        )
+        assert res["lastText"] and "generating now" in res["lastText"], res
+        assert driver._is_confirm_request(res["lastText"]) is False
+        passed += 1
+        print("PASS 13: confirm-request detected via lastText (curly/straight quotes)")
+
+        # 14. Auto-reply selection: bot hỏi A/B/C → chữ cái khớp duration;
+        # bot chỉ định token → dùng token; fallback "confirm".
+        assert driver._auto_reply_text(generate_ask) == "Generate"
+        assert driver._auto_reply_text(generate_ask, "5s") == "A"
+        assert driver._auto_reply_text(generate_ask, "10s") == "B"
+        assert driver._auto_reply_text(generate_ask, "15s") == "C"
+        # duration không có trong options → dùng token của bot
+        assert driver._auto_reply_text(generate_ask, "12s") == "Generate"
+        # parameter sheet cũ: token "confirm" (curly quotes)
+        assert driver._auto_reply_text(curly) == "confirm"
+        # match pattern nhưng không có token → fallback "confirm"
+        assert driver._auto_reply_text("Hãy xác nhận để tôi tạo video.") == "confirm"
+        # VI token + VI đơn vị giây
+        vi_ask = "Thời lượng video: A. 5 giây / B. 10 giây. Hãy trả lời \u201cTạo\u201d để bắt đầu."
+        assert driver._auto_reply_text(vi_ask) == "Tạo"
+        assert driver._auto_reply_text(vi_ask, "10s") == "B"
+        # extract negatives: không có chỉ dẫn reply / văn xuôi "5 seconds"
+        assert driver._extract_reply_token("Your video is ready.") is None
+        assert driver._duration_choice(
+            "The default is 5 seconds.", "5s") is None
+        passed += 1
+        print("PASS 14: auto-reply picks duration letter / bot token / fallback")
+
+        # 15. Choice question KHÔNG kèm lệnh reply ("Which duration do you
+        # want?" — verify live 2026-08-22, markdown bold options) vẫn detect
+        # structural + auto-reply option đầu (5s default) khi không có -d.
+        choice_ask = (
+            "I\u2019ll generate a stable locked-camera time-lapse with fast "
+            "cloud/light movement and a fixed horizon. I need one more "
+            "parameter from you:\n\n"
+            "**A. 5 seconds**\n**B. 10 seconds**\n**C. 15 seconds**\n\n"
+            "Which duration do you want?")
+        assert driver._is_choice_question(choice_ask) is True, choice_ask
+        assert driver._is_confirm_request(choice_ask) is True, choice_ask
+        assert driver._auto_reply_text(choice_ask) == "A"
+        assert driver._auto_reply_text(choice_ask, "10s") == "B"
+        assert driver._auto_reply_text(choice_ask, "15s") == "C"
+        # option đơn lẻ trong văn xuôi / "Duration: X" không phải choice q
+        assert driver._is_choice_question(
+            "I will make a 5-second version directly.") is False
+        assert driver._is_confirm_request(
+            "Please set Duration: 10 seconds and I'll generate.") is False
+        passed += 1
+        print("PASS 15: choice question without reply-token detected + answered")
     finally:
         browser.close()
         pw.stop()
 
-    print(f"\n{passed}/11 tests passed")
-    return 0 if passed == 11 else 1
+    print(f"\n{passed}/15 tests passed")
+    return 0 if passed == 15 else 1
 
 
 if __name__ == "__main__":

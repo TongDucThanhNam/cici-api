@@ -22,9 +22,17 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    # 0.45.1 introduced the `outline` surface used by the ast-tree wrapper.
+    "ast-grep-cli>=0.45.1,<0.46",
+]
+
 [project.scripts]
 # Sau `pip install -e .` lệnh `cici` sẽ available toàn hệ thống.
 cici = "cici.cli:main"
+# Progressive AST navigation for contributors (`pip install -e ".[dev]"`).
+ast-tree = "cici.devtools:main"
 
 [tool.setuptools]
 packages = ["cici"]

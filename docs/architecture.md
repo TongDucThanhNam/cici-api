@@ -14,8 +14,12 @@ signed-in browser session and must not be exposed to an untrusted network.
 
 | Component | Responsibility |
 | --- | --- |
-| `cici/server.py` | FastAPI schemas and endpoints, in-memory queue/store, worker lifespan (shim `main.py` re-exports it) |
-| `cici/driver.py` | CDP attachment, Playwright UI workflow, job model/store, single worker (shim `cici_driver.py` re-exports it) |
+| `cici/server.py` | FastAPI schemas/endpoints, queue + persistent-store composition, worker lifespan (shim `main.py` re-exports it) |
+| `cici/jobs.py` | Framework-free job model, status vocabulary, in-memory store port, queue-position calculation |
+| `cici/worker.py` | Single-consumer application service, hard deadlines, failure isolation; concrete driver is injected by `server.py` |
+| `cici/driver.py` | CDP attachment and serialized Playwright UI workflow (shim `cici_driver.py` preserves old imports) |
+| `cici/catalog.py` | The one provider-aware view over legacy Cici and nested provider model/option registries |
+| `cici/_interaction.py` | Pure refusal/confirmation classification and automatic-reply policy used by the driver |
 | `config.yaml` | CDP settings, selectors, model + option registries, timeouts, concurrency invariant. Shipped as `cici/config.yaml`; installed users edit `~/.cici/config.yaml` (auto-copied on first server boot — resolution order in `cici/_config.py`) |
 | `cici/_config.py` | Config resolution: `CICI_CONFIG` env > repo/cwd > `~/.cici/config.yaml` > packaged |
 | `cici/_persist.py` | Crash-recovery job persistence: best-effort write-through to `~/.cici/jobs.json`, reconcile in-flight jobs to `FAILED` on boot, 7-day retention pruning of terminal jobs |
@@ -27,8 +31,26 @@ signed-in browser session and must not be exposed to an untrusted network.
 | `inspect_result_images.py` | Read-only probe of result-image DOM (preview vs full-size viewer URLs) |
 | `inspect_skills.py` | Semi-read-only probe of image/video skill modes (never sends) |
 | `tests/test_result_detection.py` | Deterministic fixture-DOM tests of the result-polling JS |
+| `tests/test_architecture.py` | Hermetic contracts for jobs, catalog lookup, injected worker, and `ast-tree` command construction |
 | `tests/stress_test.py` | Full-server stress suite with scriptable fake driver (no Cici, no quota; `~/.cici` state redirected to a temp home) |
 | `test_e2e.py` | Live image-generation smoke script; not a hermetic automated test |
+
+## Layering and dependency direction
+
+Keep dependencies pointing inward. Compatibility facades may re-export names,
+but responsibility remains with the owning module.
+
+| Layer | Modules | May depend on |
+| --- | --- | --- |
+| Domain contracts | `cici/jobs.py` | Python standard library only |
+| Configuration policy | `cici/catalog.py`, `cici/_interaction.py` | Python standard library and plain config dictionaries |
+| Application service | `cici/worker.py` | domain contracts plus an injected driver protocol |
+| Adapters | `cici/server.py`, `cici/driver.py`, `cici/_client.py`, `cici/cli.py` | application/domain modules and their own framework |
+| Infrastructure support | `cici/_persist.py`, `cici/_quota.py`, `cici/_launcher.py`, `cici/_config.py` | domain contracts where needed; never CLI presentation |
+
+The checked-in AST rules in `ast-grep/rules/` mechanically protect framework
+boundaries and the single-consumer configuration. See
+`docs/code-navigation.md` for the progressive exploration workflow.
 
 ## Request and job flow
 
@@ -38,8 +60,8 @@ signed-in browser session and must not be exposed to an untrusted network.
    (per provider + account).
 2. The API stores `PENDING`, places a `Job` on `JOB_QUEUE`, and immediately
    returns HTTP 202 with the job ID.
-3. The one worker changes the state to `PROCESSING` and calls
-   `CiciDriver.execute`.
+3. The one `cici.worker` consumer changes the state to `PROCESSING` and calls
+   the injected `CiciDriver.execute` adapter.
 4. The driver switches CDP endpoint when the job's provider differs from the
    attached one (Cici 9222 / Doubao 9223 — `cdp.providers.<name>` overlay;
    disconnect only, never kills the app), then navigates to the create-image
@@ -102,7 +124,7 @@ timing out on jobs that are simply waiting their turn.
 - On an execution error, reload the page when possible so the next queued job
   does not inherit a poisoned UI state. The worker loop itself must survive errors.
 - Jobs have two deadlines: the per-kind generation timeout inside
-  `_wait_result` and a hard deadline in `run_worker`
+  `_wait_result` and a hard deadline in `cici.worker.run_worker`
   (`timing.<kind>_timeout + timing.hard_deadline_margin`) enforced with
   `asyncio.wait_for`. CDP attach is bounded by `cdp.connect_timeout` so a lost
   Cici fails the current job with a clear error instead of stalling the queue
@@ -131,9 +153,13 @@ timing out on jobs that are simply waiting their turn.
 | Change | Primary files | Also review |
 | --- | --- | --- |
 | Endpoint/schema/job state | `cici/server.py` | `cici/_client.py`, `cici/cli.py`, `README.md` |
+| Job fields/status/store/queue position | `cici/jobs.py` | `cici/worker.py`, `cici/server.py`, persistence/client contracts |
+| Worker deadline/failure behavior | `cici/worker.py` | `cici/driver.py` compatibility facade, server lifespan, stress tests |
 | Job persistence/retention | `cici/_persist.py` | Boot-restore logic in `cici/server.py`, `tests/test_persist.py` |
+| Provider/model/option lookup shape | `cici/catalog.py`, `config.yaml` | API validation, driver selection, provider tests |
+| Bot refusal/confirmation policy | `cici/_interaction.py` | Polling orchestration in `cici/driver.py`, message config, result tests |
 | Browser workflow/result detection | `cici/driver.py` | `config.yaml`, `docs/ui-automation.md` |
-| Selector/model/timing update | `config.yaml` | Driver assumptions, CLI help, `README.md` |
+| Selector/model/timing update | `config.yaml` | Catalog/driver assumptions, CLI help, `README.md` |
 | CLI command/output/exit behavior | `cici/cli.py` | `cici/_client.py`, agent integration in `README.md` |
 | Auto-launch behavior | `cici/_launcher.py`, launch scripts | platform-specific instructions in `README.md` |
 | Quota semantics | `cici/_quota.py` | API 429 handling, CLI exit code 4, `README.md` |

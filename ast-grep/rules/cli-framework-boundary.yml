@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+id: cli-framework-boundary
+language: Python
+severity: error
+message: Click/Rich imports belong in cici/cli.py.
+note: Keep rendering and process-exit behavior out of reusable client/domain modules.
+files:
+  - cici/**/*.py
+ignores:
+  - cici/cli.py
+rule:
+  any:
+    - pattern: import click
+    - pattern: from click import $$$NAMES
+    - pattern: from click.$MODULE import $$$NAMES
+    - pattern: import rich
+    - pattern: from rich import $$$NAMES
+    - pattern: from rich.$MODULE import $$$NAMES

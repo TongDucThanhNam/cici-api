@@ -1,0 +1,5 @@
+id: no-parallel-browser-operations
+valid:
+  - "await run_one_operation()"
+invalid:
+  - "await asyncio.gather(first(), second())"

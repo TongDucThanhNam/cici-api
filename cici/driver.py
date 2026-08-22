@@ -5,16 +5,16 @@ Single consumer. Hardened:
   - per-job timeout -> mark FAILED + reload page to clear zombie state
   - never crashes the worker loop (keeps draining the queue)
 
-Exposes a coroutine `run_worker(queue, status_store, cfg)` that the FastAPI
-app launches as a background task on startup.
+`Job`, `JobStore`, and `run_worker` remain re-exported here for compatibility;
+their implementations live in `cici.jobs` and `cici.worker`.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,6 +26,14 @@ from playwright.async_api import (
     TimeoutError as PWTimeoutError,
     async_playwright,
 )
+
+from cici._interaction import (
+    DEFAULT_CONFIRM_PATTERNS as _DEFAULT_CONFIRM_PATTERNS,
+    DEFAULT_REFUSAL_PATTERNS as _DEFAULT_REFUSAL_PATTERNS,
+    InteractionPolicy,
+)
+from cici.catalog import ConfigCatalog
+from cici.jobs import Job, JobStore
 
 # quota tracking cùng package (CLI cài riêng vẫn chạy được core standalone)
 try:
@@ -54,14 +62,20 @@ class ContentBlocked(Exception):
         self.raw_message = message
 
 
-# Fallback refusal patterns nếu config thiếu messages.refusal_patterns.
-# (Wording Cici có thể đổi — thêm vào config.yaml khi thấy pattern mới.)
-_DEFAULT_REFUSAL_PATTERNS = [
-    "bảo vệ bản quyền",
-    "bản quyền",
-    "to protect copyright",
-    "copyright",
-]
+class NeedsInteraction(Exception):
+    """Bot hỏi xác nhận lặp lại sau N lần auto-reply "confirm".
+
+    Prompt dạng parameter sheet đôi khi khiến Dola hỏi "Reply 'confirm' and
+    I'll generate" thay vì gen ngay. Driver tự reply "confirm" tối đa
+    messages.auto_confirm_max lần; vẫn hỏi lại → fail nhanh (không spin tới
+    timeout, không block queue) + reload page cho job kế.
+    """
+    def __init__(self, message: str, kind: str, attempts: int):
+        super().__init__(message)
+        self.kind = kind
+        self.raw_message = message
+        self.attempts = attempts
+
 
 log = logging.getLogger("cici.driver")
 
@@ -72,36 +86,6 @@ log = logging.getLogger("cici.driver")
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
-# --------------------------------------------------------------------------- #
-# Job data (shared with main.py)
-# --------------------------------------------------------------------------- #
-@dataclass
-class Job:
-    job_id: str
-    kind: str            # "image" | "video"
-    prompt: str
-    model: str | None = None   # alias trong config.yaml models.<kind>.options[].alias
-    references: list[str] = field(default_factory=list)  # local file paths for reference-image gen
-    ratio: str | None = None       # alias config.yaml options.<kind>.ratios[].alias (vd "16:9")
-    style: str | None = None       # alias options.image.styles[].alias (image only)
-    duration: str | None = None    # alias options.video.durations[].alias (video only, "5s"/"10s")
-    account: str | None = None     # nhãn tách quota local (user TỰ đổi account trong app — tool không tự đổi)
-    provider: str = "cici"         # "cici" | "doubao" — app/CDP endpoint + registry riêng
-    created_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class JobStore:
-    """In-memory job status. Swap for Redis in production."""
-    data: dict[str, dict] = field(default_factory=dict)
-
-    def set(self, job_id: str, **fields) -> None:
-        self.data.setdefault(job_id, {}).update(fields)
-
-    def get(self, job_id: str) -> Optional[dict]:
-        return self.data.get(job_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -140,14 +124,15 @@ _SNAPSHOT_JS = r"""({sel}) => {
 _POLL_RESULT_JS = r"""({sel, before, mediaBefore, kind}) => {
     const collectVideos = (root) => {
         const out = [];
-        root.querySelectorAll('video').forEach(v => {
-            const s = v.currentSrc || v.src || '';
-            if (s && !s.startsWith('data:') && !s.startsWith('blob:')) out.push(s);
-        });
-        root.querySelectorAll('video source').forEach(v => {
-            const s = v.src || '';
-            if (s && !s.startsWith('data:') && !s.startsWith('blob:')) out.push(s);
-        });
+        const seen = new Set();
+        const push = (s) => {
+            if (s && !s.startsWith('data:') && !s.startsWith('blob:') && !seen.has(s)) {
+                seen.add(s);
+                out.push(s);
+            }
+        };
+        root.querySelectorAll('video').forEach(v => push(v.currentSrc || v.src || ''));
+        root.querySelectorAll('video source').forEach(v => push(v.src || ''));
         return out;
     };
     const clickUnloadedVideoBlocks = (root) => {
@@ -182,10 +167,20 @@ _POLL_RESULT_JS = r"""({sel, before, mediaBefore, kind}) => {
                 newOnes.forEach(m => clickUnloadedVideoBlocks(m));
             }
             const text = newOnes.map(m => (m.innerText || '')).join('\n').slice(0, 800);
+            // Doubao: action bar KHÔNG xuất hiện trên video message → fallback
+            // done theo text thông báo hoàn tất (sel.video_done_patterns,
+            // case-insensitive substring). Contract giữ nguyên: done vẫn yêu
+            // cầu videos.length > 0 (URL thật) bên dưới.
+            const pats = sel.video_done_patterns || [];
+            const lowText = text.toLowerCase();
+            const textDone = pats.some(p => {
+                try { return lowText.includes(String(p).toLowerCase()); } catch (e) { return false; }
+            });
             return {
                 mode: 'chat', recv: recvs.length, newRecv: newOnes.length,
-                done: done && videos.length > 0,
+                done: (done || textDone) && videos.length > 0,
                 urls: videos, videoBlocks, text,
+                lastText: (last.innerText || '').slice(0, 400),
             };
         }
         const text = newOnes.map(m => (m.innerText || '')).join('\n').slice(0, 800);
@@ -231,12 +226,104 @@ _FULLSIZE_JS = r"""({marker}) => {
 }"""
 
 
+def _parse_watermark_free_video(payload: Any) -> list[str]:
+    """Trích URL video KHÔNG watermark từ response get_without_watermark.
+
+    Shape (theo client bundle Cici build 147.0.7727.149, requestScene
+    "remove_ai_watermark"):
+      {"code": 0, "data": {"download_video": {"<vid>": {
+          "download_url": str | list[str],      # URL sạch ưu tiên
+          "video_model": [{"main_url"|"url": str}, ...]   # fallback
+      }}}}
+
+    Nhận cả raw text JSON lẫn dict đã parse. Trả list URL theo thứ tự; rỗng khi
+    không có gì dùng được (account không được bật tính năng / shape đổi).
+    """
+    if isinstance(payload, (str, bytes, bytearray)):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    download_video = data.get("download_video")
+    if not isinstance(download_video, dict):
+        return []
+    out: list[str] = []
+    for entry in download_video.values():
+        if not isinstance(entry, dict):
+            continue
+        got: list[str] = []
+        du = entry.get("download_url")
+        if isinstance(du, str):
+            got.append(du)
+        elif isinstance(du, list):
+            got.extend(u for u in du if isinstance(u, str))
+        if not got:
+            for vm in entry.get("video_model") or []:
+                if isinstance(vm, dict):
+                    u = vm.get("main_url") or vm.get("url")
+                    if isinstance(u, str):
+                        got.append(u)
+        out.extend(got)
+    return out
+
+
+def _extract_video_resource_keys(video_urls: list[str]) -> tuple[list[str], list[str]]:
+    """Suy ra (vids, uris) từ các URL video CDN của Cici/Doubao.
+
+    Shape URL (verify build 147.0.7727.149):
+      https://v16-dola.dola.com/<hash1>/<hash2>/video/tos/<region>/<bucket>/<key>/...
+      vd bucket = tos-mya-ve-50851, key = oYixyBES31DD...
+
+    API get_without_watermark nhận:
+      vid = <key>          (verify live: code 0)
+      uri = <bucket>/<key> (verify live: code 0)
+    Trả (keys, bucket/key list) khử trùng, giữ thứ tự.
+    """
+    vids: list[str] = []
+    uris: list[str] = []
+    for u in video_urls:
+        try:
+            path = u.split("?", 1)[0].split("#", 1)[0]
+        except Exception:  # noqa: BLE001 — URL rác thì bỏ qua
+            continue
+        if "/video/tos/" not in path:
+            continue
+        tail = path.split("/video/tos/", 1)[1].strip("/")
+        parts = [p for p in tail.split("/") if p]
+        # tail = <region>/<bucket>/<key> — cần ít nhất 3 phần sau "tos"
+        if len(parts) < 3:
+            continue
+        bucket, key = parts[-2], parts[-1]
+        if not key or key in vids:
+            continue
+        vids.append(key)
+        uris.append(f"{bucket}/{key}")
+    return vids, uris
+
+
+# Gọi API get_without_watermark từ context trang chat (cookie phiên tự đính kèm).
+# Trả body text thô để _parse_watermark_free_video xử lý.
+_WATERMARK_FETCH_JS = r"""async ({host, payload}) => {
+    const r = await fetch('https://' + host + '/creativity/resource/get_without_watermark', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)});
+    return await r.text();
+}"""
+
+
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
 class CiciDriver:
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.catalog = ConfigCatalog(cfg)
         self.sel = cfg["selectors"]
         self.tm = cfg["timing"]
         self._pw = None
@@ -251,6 +338,17 @@ class CiciDriver:
         self.refusal_patterns: list[str] = (
             cfg.get("messages", {}).get("refusal_patterns") or _DEFAULT_REFUSAL_PATTERNS
         )
+        # confirm-request patterns: bot hỏi xác nhận trước khi gen — driver tự
+        # reply "confirm" (bounded) thay vì spin tới timeout.
+        self.confirm_patterns: list[str] = (
+            cfg.get("messages", {}).get("confirm_request_patterns") or _DEFAULT_CONFIRM_PATTERNS
+        )
+        self._interaction = InteractionPolicy(
+            self.refusal_patterns,
+            self.confirm_patterns,
+        )
+        self.auto_confirm_max: int = int(
+            cfg.get("messages", {}).get("auto_confirm_max", 2) or 0)
 
     # ---- provider resolution -------------------------------------------- #
     def _cdp_for(self, provider: str) -> dict:
@@ -262,27 +360,63 @@ class CiciDriver:
         return cdp
 
     def _registry(self, section: str, provider: str) -> dict:
-        """models/options cho provider.
+        """Backward-compatible facade over the shared provider catalog."""
 
-        Section legacy (flat theo kind) = registry của "cici" — phải loại các
-        key provider (models.doubao...) khỏi view này. Provider khác nằm ở key
-        trùng tên provider trong cùng section (models.doubao, ...).
-        """
-        data = self.cfg.get(section, {})
-        prov_names = set(self.cfg.get("providers", {}) or {})
-        if provider in data:
-            return data[provider]
-        return {k: v for k, v in data.items() if k not in prov_names}
+        return self.catalog.section(section, provider)
 
     def _is_refusal_message(self, text: str) -> bool:
-        """Cici từ chối hiển thị kết quả (bản quyền / content policy)?
+        """Cici từ chối hiển thị kết quả (bản quyền / content policy)?"""
 
-        Match case-insensitive substring với refusal_patterns trong config.
+        return self._interaction.is_refusal(text)
+
+    def _is_confirm_request(self, text: str) -> bool:
+        """Bot đang hỏi xác nhận ("Reply 'confirm'...", "reply "Generate"...")
+        thay vì gen?
+
+        Match case-insensitive substring với confirm_request_patterns trong
+        config, HOẶC structural: text chứa ≥2 option chọn theo chữ cái kèm
+        thời lượng (A. 5 seconds / B. 10 giây…) — Dola đôi khi hỏi "Which
+        duration do you want?" mà không kèm lệnh "reply X". Chỉ dùng cho LAST
+        bot message (lastText) — text gộp của nhiều message sẽ khớp vĩnh viễn
+        sau khi đã reply.
         """
-        if not text:
-            return False
-        low = text.lower()
-        return any(p.lower() in low for p in self.refusal_patterns)
+        return self._interaction.is_confirm_request(text)
+
+    # Bot chỉ định token để user reply tiếp tục — token nằm trong cặp nháy
+    # (straight/curly): Reply "confirm" / reply “Generate” / trả lời “Tạo”.
+    _REPLY_TOKEN_RE = InteractionPolicy.REPLY_TOKEN_RE
+    # Câu hỏi chọn theo chữ cái: "A. 5 seconds" / "B. 10 giây" / "C. 15秒"
+    # / "A. 5s". Yêu cầu delimiter sau chữ cái để không khớp "a 5 seconds"
+    # trong văn xuôi.
+    _CHOICE_RE = InteractionPolicy.CHOICE_RE
+
+    def _extract_reply_token(self, text: str) -> str | None:
+        """Token bot bảo user reply ("Generate"/"confirm"/…) — None nếu không có."""
+        return self._interaction.extract_reply_token(text)
+
+    def _duration_choice(self, text: str, duration: str | None) -> str | None:
+        """Bot hỏi chọn A/B/C theo số giây — trả chữ cái khớp duration alias
+        ("10s" → "B"). Duration None / không khớp option → None."""
+        return self._interaction.duration_choice(text, duration)
+
+    def _is_choice_question(self, text: str) -> bool:
+        """Text có ≥2 option chọn theo chữ cái kèm thời lượng (A. 5 seconds…)?
+
+        Dola có khi hỏi "Which duration do you want?" mà không kèm lệnh
+        "reply X" — danh sách A/B/C vẫn là câu hỏi chờ input, driver phải tự
+        reply. Option đơn lẻ trong văn xuôi ("a 5-second version") không tính.
+        """
+        return self._interaction.is_choice_question(text)
+
+    def _auto_reply_text(self, text: str, duration: str | None = None) -> str:
+        """Nội dung tự reply khi bot hỏi xác nhận:
+        1. Có options A/B/C theo giây + job đặt duration → trả chữ cái khớp
+           (job -d 10s phải ra video 10s, không rơi về default 5s).
+        2. Bot chỉ định token ("Generate"/"confirm") → trả token đó.
+        3. Chỉ có danh sách A/B/C (không token) → option đầu (5s default).
+        4. Fallback → "confirm".
+        """
+        return self._interaction.auto_reply_text(text, duration)
 
     # ---- connection lifecycle ------------------------------------------- #
     async def connect(self) -> None:
@@ -420,29 +554,13 @@ class CiciDriver:
     def _resolve_model(self, kind: str, alias: str | None) -> dict:
         """Look up model option trong registry của provider hiện tại.
         Alias None → default."""
-        registry = self._registry("models", self._current_provider).get(kind, {})
-        if not alias:
-            alias = registry.get("default")
-        for opt in registry.get("options", []):
-            if opt["alias"] == alias:
-                return opt
-        raise ValueError(
-            f"Unknown model '{alias}' for kind '{kind}'. "
-            f"Valid: {[o['alias'] for o in registry.get('options', [])]}"
-        )
+
+        return self.catalog.resolve_model(kind, alias, self._current_provider)
 
     def _resolve_option(self, kind: str, group: str, alias: str) -> dict:
         """Look up an option in registry của provider hiện tại
         (cfg['options'][<kind>][<group>] theo provider)."""
-        opts = (self._registry("options", self._current_provider)
-                .get(kind, {}).get(group, []))
-        for o in opts:
-            if o["alias"] == alias:
-                return o
-        raise ValueError(
-            f"Unknown {group} '{alias}' for kind '{kind}'. "
-            f"Valid: {[o['alias'] for o in opts]}"
-        )
+        return self.catalog.resolve_option(kind, group, alias, self._current_provider)
 
     @staticmethod
     def _has_text(select_text: str | list[str], exact: bool = False):
@@ -572,7 +690,8 @@ class CiciDriver:
 
     async def _wait_result(self, timeout: float, kind: str = "image",
                            bot_count_before: int = 0,
-                           media_before: list[str] | None = None) -> list[str]:
+                           media_before: list[str] | None = None,
+                           duration: str | None = None) -> list[str]:
         """Poll result; return list of generated media URLs when done.
 
         Race-safe: branch chat chỉ nhìn bot messages từ index `bot_count_before`
@@ -586,13 +705,20 @@ class CiciDriver:
         deadline = time.time() + timeout
         interval = self.tm["poll_interval"]
         media_before = media_before or []
+        # sel cho poll: ghép thêm video_done_patterns (messages config) để
+        # _POLL_RESULT_JS dùng làm done fallback cho video (Doubao).
+        poll_sel = dict(self.sel)
+        done_pats = self.cfg.get("messages", {}).get("video_done_patterns")
+        if done_pats:
+            poll_sel["video_done_patterns"] = done_pats
         last_url_count = -1
         last_urls: list[str] | None = None
         stable_polls = 0
+        confirms_sent = 0
         while time.time() < deadline:
             res = await page.evaluate(
                 _POLL_RESULT_JS,
-                {"sel": self.sel, "before": bot_count_before, "mediaBefore": media_before, "kind": kind},
+                {"sel": poll_sel, "before": bot_count_before, "mediaBefore": media_before, "kind": kind},
             )
             # detect quota-exhausted message BEFORE treating as success/timeout
             if _quota and res.get("text") and _quota.is_exhausted_message(res["text"]):
@@ -601,6 +727,39 @@ class CiciDriver:
             # Fail nhanh thay vì spin tới timeout (bảo vệ quota + thời gian).
             if res.get("text") and self._is_refusal_message(res["text"]):
                 raise ContentBlocked(res["text"], kind)
+            # Bot hỏi xác nhận ("Reply 'confirm'...", "reply "Generate"...")
+            # thay vì gen — phổ biến với prompt dạng parameter sheet. Tự reply
+            # (bounded): chữ cái khớp duration nếu bot hỏi A/B/C, ngược lại
+            # token bot chỉ định ("Generate"/"confirm"). Hỏi lại quá số lần →
+            # fail nhanh, không spin tới timeout. Chỉ soi LAST bot message để
+            # không khớp lại câu hỏi đã reply.
+            last_text = res.get("lastText") or ""
+            if (res.get("mode") == "chat" and res.get("newRecv", 0) > 0
+                    and not res.get("urls")
+                    and self._is_confirm_request(last_text)):
+                if confirms_sent < self.auto_confirm_max:
+                    confirms_sent += 1
+                    reply = self._auto_reply_text(last_text, duration)
+                    log.info("Bot hỏi xác nhận — tự reply %r (lần %d/%d)",
+                             reply, confirms_sent, self.auto_confirm_max)
+                    try:
+                        await self._type_prompt(reply)
+                        await self._send()
+                    except Exception as e:  # noqa: BLE001 — reply fail thì skip
+                        log.warning("Auto-confirm reply failed: %s", e)
+                    await asyncio.sleep(interval)
+                    continue
+                raise NeedsInteraction(
+                    last_text or res.get("text") or "", kind, confirms_sent)
+            # Doubao (verify live 2026-08-22): xgplayer chỉ lazy-init khi HOVER
+            # thật bằng input event — JS click trong evaluate không khởi động
+            # được. Hover block video cuối mỗi khi chưa đọc được URL nào.
+            if (kind == "video" and not res.get("urls")
+                    and res.get("videoBlocks", 0) > 0):
+                try:
+                    await page.locator(self.sel["result_video"]).last.hover(timeout=2000)
+                except Exception:  # noqa: BLE001 — hover best-effort
+                    pass
             if res.get("mode") == "chat":
                 # phải có ít nhất 1 bot message mới (job này đã được Cici nhận)
                 if res.get("newRecv", 0) > 0 and res["urls"]:
@@ -736,6 +895,59 @@ class CiciDriver:
             except Exception:  # noqa: BLE001
                 pass
 
+    async def _capture_watermark_free_video(self, video_urls: list[str],
+                                            bot_count_before: int = 0) -> list[str]:
+        """Đổi URL video (kèm watermark) lấy URL KHÔNG watermark — best-effort.
+
+        Gọi TRỰC TIẾP API sanctioned của ByteDance từ context trang chat
+        (cookie phiên của app tự đính kèm):
+          POST https://<host>/creativity/resource/get_without_watermark
+          {"vid": ["<object-key>"]}   (hoặc {"uri": ["<bucket>/<object-key>"]})
+
+        vid/uri suy ra từ chính URL video (path /video/tos/<...>/<bucket>/<key>/).
+        Verify live 2026-08-22: đúng shape array thì server trả code 0; account
+        không có entitlement → `without_watermark: false` (không có URL sạch)
+        → giữ URL gốc, job vẫn COMPLETED.
+
+        Host per provider: selectors.video_watermark_api_hosts.<provider>.
+        Provider ngoài selectors.video_watermark_providers → bỏ qua.
+        """
+        if not video_urls:
+            return video_urls
+        providers = self.sel.get("video_watermark_providers") or ["cici"]
+        if self._current_provider not in providers:
+            return video_urls
+        host = (self.sel.get("video_watermark_api_hosts") or {}).get(self._current_provider)
+        if not host:
+            return video_urls
+        vids, uris = _extract_video_resource_keys(video_urls)
+        if not vids and not uris:
+            return video_urls
+        budget = self.tm.get("video_watermark_wait", 30)
+        page = await self._ensure_page()
+        try:
+            for payload in ({"vid": vids}, {"uri": uris}):
+                if not payload.get("vid") and not payload.get("uri"):
+                    continue
+                try:
+                    body = await asyncio.wait_for(
+                        page.evaluate(_WATERMARK_FETCH_JS,
+                                      {"host": host, "payload": payload}),
+                        timeout=budget)
+                except Exception as e:  # noqa: BLE001 — network/eval fail
+                    log.warning("Watermark-free fetch failed (%s) — thử biến thể kế", e)
+                    continue
+                clean = _parse_watermark_free_video(body)
+                if clean:
+                    log.info("Watermark-free upgrade: %d/%d URL video sạch thu được",
+                             len(clean), len(video_urls))
+                    return clean
+            log.info("Watermark-free upgrade: without_watermark=false — giữ URL gốc")
+            return video_urls
+        except Exception as e:  # noqa: BLE001 — capture là best-effort
+            log.warning("Watermark-free capture failed (%s) — dùng URL gốc", e)
+            return video_urls
+
     # ---- high-level job execution --------------------------------------- #
     async def execute(self, job: Job) -> dict[str, Any]:
         async with self._lock:
@@ -767,10 +979,14 @@ class CiciDriver:
                 urls = await self._wait_result(
                     timeout, kind=job.kind,
                     bot_count_before=bot_count_before, media_before=media_before,
+                    duration=job.duration,
                 )
                 # ảnh: nâng lên bản gốc full-size (viewer lazy-load) — best-effort
                 if job.kind == "image":
                     urls = await self._upgrade_to_fullsize(urls, bot_count_before)
+                # video: capture URL không watermark qua flow download của app
+                elif job.kind == "video":
+                    urls = await self._capture_watermark_free_video(urls, bot_count_before)
                 # success → record quota (theo account label + provider nếu có)
                 if _quota:
                     state = _quota.load_account(job.account, provider=job.provider)
@@ -811,6 +1027,21 @@ class CiciDriver:
                     "kind": job.kind,
                     "message": e.raw_message,
                 }
+            except NeedsInteraction as e:
+                # Bot hỏi xác nhận lặp lại sau N lần auto-reply "confirm" — fail
+                # nhanh + reload page để job kế không kẹt conversation cũ.
+                log.warning("Job %s NEEDS INTERACTION (kind=%s, replies=%d): %s",
+                            job.job_id, job.kind, e.attempts, e.raw_message[:160])
+                await self.recover()
+                return {
+                    "status": "FAILED",
+                    "kind": job.kind,
+                    "error": (
+                        f"Dola vẫn yêu cầu xác nhận sau {e.attempts} lần reply "
+                        f"'confirm' — đổi prompt đơn giản hơn rồi thử lại"
+                    ),
+                    "message": e.raw_message,
+                }
             except Exception as e:  # noqa: BLE001
                 log.error("Job %s failed: %s", job.job_id, e)
                 # clear zombie state so the next job isn't poisoned
@@ -826,36 +1057,8 @@ async def run_worker(
     store: JobStore,
     cfg: dict,
 ) -> None:
-    driver = CiciDriver(cfg)
-    log.info("Worker starting; Playwright up (CDP attach lazily ở job đầu tiên).")
-    await driver.connect()
-    log.info("Worker ready, waiting for jobs.")
-    while True:
-        job: Job = await queue.get()
-        store.set(job.job_id, status="PROCESSING", started_at=time.time())
-        log.info("Processing job %s (%s)", job.job_id, job.kind)
-        # Hard deadline = gen timeout + margin cho UI steps/upload. Bảo vệ queue
-        # khi driver treo ngoài _wait_result (CDP retry, page.evaluate hang…).
-        tm = cfg.get("timing", {})
-        gen_to = tm.get(f"{job.kind}_timeout", 300 if job.kind == "image" else 600)
-        margin = tm.get("hard_deadline_margin", 180)
-        budget = gen_to + margin
-        try:
-            result = await asyncio.wait_for(driver.execute(job), timeout=budget)
-            store.set(job.job_id, finished_at=time.time(), **result)
-        except asyncio.TimeoutError:
-            log.error("Job %s vượt hard deadline %.0fs — recover UI, đánh FAILED", job.job_id, budget)
-            if hasattr(driver, "recover"):
-                await driver.recover()
-            store.set(
-                job.job_id,
-                status="FAILED",
-                error=(f"Job vượt hard deadline {budget:.0f}s (gen {gen_to:.0f}s + margin {margin:.0f}s) — "
-                       "Cici có thể treo hoặc CDP mất. Thử lại job; nếu lặp lại, restart Cici (start_cici.bat)."),
-                finished_at=time.time(),
-            )
-        except Exception as e:  # noqa: BLE001  never kill the loop
-            log.exception("Unhandled worker error on job %s", job.job_id)
-            store.set(job.job_id, status="FAILED", error=str(e), finished_at=time.time())
-        finally:
-            queue.task_done()
+    """Compatibility facade; worker policy lives in :mod:`cici.worker`."""
+
+    from cici.worker import run_worker as _run_worker
+
+    await _run_worker(queue, store, cfg, driver_factory=CiciDriver)

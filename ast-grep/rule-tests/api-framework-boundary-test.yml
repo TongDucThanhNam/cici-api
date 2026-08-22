@@ -1,0 +1,6 @@
+id: api-framework-boundary
+valid:
+  - "from cici.catalog import ConfigCatalog"
+invalid:
+  - "from fastapi import HTTPException"
+  - "from pydantic import BaseModel"

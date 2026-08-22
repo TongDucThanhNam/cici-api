@@ -1,7 +1,7 @@
 """Job store persistence — write-ahead JSON file for crash recovery.
 
 Tại sao cần:
-  JobStore trong cici/driver.py là in-memory dict; server restart mất hết job. Khi
+  JobStore trong cici/jobs.py là in-memory dict; server restart mất hết job. Khi
   Cici/CDP chết giữa job đang xử lý, user phải tự re-enqueue — khó chịu cho
   batch/agent user. File này cung cấp load/save đơn giản, fail-open y hệt
   _quota.py: corrupt file → empty dict, OSError/JSONDecodeError bị nuốt.
@@ -45,18 +45,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cici.jobs import (
+    IN_FLIGHT_STATUSES as _IN_FLIGHT_STATUSES,
+    TERMINAL_STATUSES as _TERMINAL_STATUSES,
+)
+
 DEFAULT_JOBS_PATH = Path.home() / ".cici" / "jobs.json"
 
 # Retention: job terminal cũ hơn khoảng này bị bỏ khỏi file khi save — jobs.json
 # chứa đầy đủ prompt + result URL nên không để mọc vô hạn theo thời gian sử dụng.
 DEFAULT_RETENTION_SECONDS = 7 * 24 * 3600
-
-# Status mà server restart sẽ "thu dọn" thành FAILED — job đang chờ hoặc đang xử lý
-# khi crash không thể tin tưởng kết quả.
-_IN_FLIGHT_STATUSES = ("PENDING", "PROCESSING")
-
-# Status kết thúc — chỉ các status này mới đủ điều kiện bị prune theo retention.
-_TERMINAL_STATUSES = ("COMPLETED", "FAILED", "QUOTA_EXHAUSTED", "CONTENT_BLOCKED")
 
 # Trường per-call mà /api/status tự thêm vào (không persist).
 EPHEMERAL_KEYS = ("queue_ahead", "queue_size")

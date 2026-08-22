@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+id: api-framework-boundary
+language: Python
+severity: error
+message: FastAPI/Pydantic imports belong in cici/server.py.
+note: Keep domain and application-service modules independent of HTTP schemas and errors.
+files:
+  - cici/**/*.py
+ignores:
+  - cici/server.py
+rule:
+  any:
+    - pattern: import fastapi
+    - pattern: from fastapi import $$$NAMES
+    - pattern: from fastapi.$MODULE import $$$NAMES
+    - pattern: import pydantic
+    - pattern: from pydantic import $$$NAMES
+    - pattern: from pydantic.$MODULE import $$$NAMES

@@ -32,6 +32,7 @@ These instructions apply to the entire repository. Always communicate in English
 
 | Read this | When to read it |
 | --- | --- |
+| [Code navigation and AST tooling](docs/code-navigation.md) | Exploring an unfamiliar area, using `ast-tree`/`ast-grep`, or adding architecture rules |
 | [Architecture and invariants](docs/architecture.md) | Changing request flow, job state, queueing, storage, driver boundaries, or file ownership |
 | [Development guide](docs/development.md) | Setting up the project or changing Python, dependencies, configuration, API, or CLI behavior |
 | [Testing and verification](docs/testing.md) | Before validating any change; especially before a live smoke test |

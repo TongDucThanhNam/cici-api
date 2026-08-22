@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+id: browser-library-boundary
+language: Python
+severity: error
+message: Playwright imports belong in cici/driver.py.
+note: Keep browser details behind CiciDriver; expose a narrow method or pure helper instead.
+files:
+  - cici/**/*.py
+ignores:
+  - cici/driver.py
+rule:
+  any:
+    - pattern: import playwright
+    - pattern: import playwright.$MODULE
+    - pattern: from playwright import $$$NAMES
+    - pattern: from playwright.$MODULE import $$$NAMES

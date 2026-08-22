@@ -1,0 +1,6 @@
+id: single-consumer-worker-count
+valid:
+  - "worker_count: 1"
+invalid:
+  - "worker_count: 2"
+  - "worker_count: 0"

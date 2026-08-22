@@ -1,0 +1,6 @@
+id: cli-framework-boundary
+valid:
+  - "import json"
+invalid:
+  - "import click"
+  - "from rich.console import Console"

@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from cici.jobs import TERMINAL_STATUSES
+
 DEFAULT_BASE = os.environ.get("CICI_API", "http://127.0.0.1:8000")
 
 # Exit codes (chuẩn hoá để AI agent phân biệt lỗi)
@@ -122,11 +124,6 @@ class QuotaExhausted(Exception):
         super().__init__(detail.get("message", "quota exhausted"))
 
 
-# Trạng thái terminal của job — wait_status dừng ngay khi thấy (đủ sớm, đủ
-# đúng): QUOTA_EXHAUSTED/CONTENT_BLOCKED cũng là kết quả cuối, không poll tiếp.
-TERMINAL_STATUSES = ("COMPLETED", "FAILED", "QUOTA_EXHAUSTED", "CONTENT_BLOCKED")
-
-
 def quota(kind: str | None = None, account: str | None = None,
           base: str = DEFAULT_BASE, timeout: float = 10.0,
           provider: str = "cici") -> dict:
@@ -193,7 +190,10 @@ def wait_status(
     polls_in_status = 0  # số lần liên tiếp poll thấy cùng status
     while True:
         now = time.time()
-        if now > pending_cap:
+        # Cap chỉ ràng buộc thời gian chờ PENDING (job chưa được worker nhận).
+        # Một khi job đã PROCESSING, ngân sách xử lý (dưới) là người quyết định —
+        # tránh TIMEOUT oan "chưa bắt đầu xử lý" khi job đang chạy thật.
+        if processing_start is None and now > pending_cap:
             raise TimeoutError(
                 f"job {job_id} chưa bắt đầu xử lý sau khi chờ queue "
                 f"(ahead={queue_ahead}; cuối: {last.get('status')})"

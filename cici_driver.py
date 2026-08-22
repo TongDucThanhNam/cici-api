@@ -8,4 +8,5 @@ from cici.driver import (  # noqa: F401 — star-import bỏ qua tên underscore
     _FULLSIZE_JS,
     _POLL_RESULT_JS,
     _SNAPSHOT_JS,
+    _parse_watermark_free_video,
 )

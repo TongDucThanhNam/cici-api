@@ -93,8 +93,29 @@ def main() -> int:
     passed += 1
     print("PASS 6: queue_ahead counts only PENDING jobs enqueued earlier")
 
-    print(f"\n{passed}/6 tests passed")
-    return 0 if passed == 6 else 1
+    # 7. Regression: pending_cap KHÔNG áp dụng sau khi job đã PROCESSING.
+    # Job PENDING tới ~1.2s rồi mới PROCESSING; cap = 0.5*(2+1) = 1.5s bị vượt
+    # LÚC ĐANG PROCESSING nhưng budget xử lý (0.5s từ 1.2s = 1.7s) chưa cạn.
+    # Bản cũ raise oan "chưa bắt đầu xử lý ... queue" ở 1.5s; bản đúng phải chờ
+    # hết budget xử lý rồi báo TIMEOUT PROCESSING.
+    t0 = time.time()
+
+    def clock_fn(job_id):
+        s = "PENDING" if time.time() - t0 < 1.2 else "PROCESSING"
+        return {"status": s, "queue_ahead": 2} if s == "PENDING" else {"status": s}
+
+    try:
+        _client.wait_status("j7", timeout=0.5, poll_interval=0.02, status_fn=clock_fn)
+        raise AssertionError("expected TimeoutError")
+    except TimeoutError as e:
+        assert "PROCESSING" in str(e) and "queue" not in str(e), e
+    elapsed = time.time() - t0
+    assert 1.2 <= elapsed < 3.0, f"timeline sai: {elapsed:.2f}s"
+    passed += 1
+    print(f"PASS 7: pending_cap ignored once PROCESSING (elapsed {elapsed:.2f}s)")
+
+    print(f"\n{passed}/7 tests passed")
+    return 0 if passed == 7 else 1
 
 
 if __name__ == "__main__":

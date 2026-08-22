@@ -61,6 +61,33 @@ rejected server-side for `provider=doubao`.
   `img`; the `<video>` element (src on `v16-dola.dola.com`) is lazily created by
   xgplayer **only after the block is clicked**. `_wait_result` clicks unloaded
   blocks and reads `video.src` on a later poll. Video URLs carry no `x-expires`.
+  **Doubao difference (verified live 2026-08-22)**: the player initializes only
+  on a **trusted hover** (synthetic JS clicks do nothing), so the poll loop
+  hovers the last video block via Playwright when no URL has been read yet;
+  and Doubao video messages never render the action bar, so completion falls
+  back to `messages.video_done_patterns` text matching (still gated on having
+  a real `<video>` src).
+- **Confirm-request handling**: parameter-sheet-style prompts can make Dola
+  reply "Reply "confirm" and I'll generate it directly." instead of
+  generating, ask a lettered question ("A. 5 seconds / B. 10 seconds /
+  C. 15 seconds … Or just reply “Generate”"), or ask "Which duration do you
+  want?" with no reply instruction at all. `_wait_result` watches the LAST
+  new bot message's text (`lastText` from `_POLL_RESULT_JS` — not the joined
+  text, so an already answered question can't re-match) via
+  `_is_confirm_request` (`messages.confirm_request_patterns` — phrase
+  patterns plus generic `reply "`/`reply “` instruction markers — or
+  structural: ≥2 lettered duration options in the message, see
+  `_is_choice_question`) and auto-replies through the normal input, bounded
+  by `messages.auto_confirm_max`. The reply content comes from
+  `_auto_reply_text`: (1) if the message lists lettered duration options and
+  the job set a duration, the matching letter ("B" for `-d 10s`) so the job
+  doesn't silently fall back to the 5s default; (2) otherwise the token the
+  bot asked for (`_extract_reply_token` — "Generate"/"confirm", straight or
+  curly quotes); (3) the first option ("A", the 5s default) when only a
+  choice list is present and no `-d` was set; (4) fallback "confirm".
+  Exceeding the bound raises `NeedsInteraction` → job FAILED fast with a
+  clear error + page reload, instead of spinning to the generation timeout
+  and blocking the single-consumer queue.
 - Chat image results render two `<img>` per `mdbox_image`: an SVG placeholder
   declaring the full dimensions plus the preview (`~tplv-…-downsize_watermark`,
   ~288px). The **full-size original** (`~tplv-…-image_pre_watermark`, e.g.
@@ -78,6 +105,21 @@ rejected server-side for `provider=doubao`.
   `i_pre_wm` (e.g. 2848×1600) which appears **only on the network** — the DOM
   `<img>` keeps the preview src, so the request listener is the only source.
   Marker per provider: `selectors.fullsize_markers.<provider>`.
+- **Watermark-free video**: after `_wait_result` succeeds on a video job,
+  `_capture_watermark_free_video` calls ByteDance's sanctioned
+  `POST /creativity/resource/get_without_watermark` **directly from the chat
+  page context** (the app session's cookies attach automatically) via
+  `_WATERMARK_FETCH_JS`. The `vid` (object key) and `uri`
+  (`<bucket>/<object-key>`) are derived from the result video URL by
+  `_extract_video_resource_keys` — verified live 2026-08-22:
+  array-form payloads return `code 0`; string-form returns `710010202`. The
+  clean URLs live in `data.download_video[vid].download_url` (parsed by the
+  pure helper `_parse_watermark_free_video`). **Entitlement is server-side**:
+  accounts without it get `without_watermark: false` and the driver falls back
+  to the original watermarked URLs (job still completes). Hosts per provider
+  in `selectors.video_watermark_api_hosts`; only providers listed in
+  `selectors.video_watermark_providers` attempt the call. Budget:
+  `timing.video_watermark_wait`.
 
 ## Selector-change workflow
 

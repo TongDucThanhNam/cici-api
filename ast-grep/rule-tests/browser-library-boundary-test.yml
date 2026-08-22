@@ -1,0 +1,6 @@
+id: browser-library-boundary
+valid:
+  - "from cici.jobs import Job"
+invalid:
+  - "from playwright.async_api import Page"
+  - "import playwright"

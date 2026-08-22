@@ -21,7 +21,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from cici import __version__, _config
-from cici.driver import CiciDriver, Job, JobStore  # noqa: F401 (CiciDriver: re-export)
+from cici.catalog import ConfigCatalog
+from cici.driver import CiciDriver  # noqa: F401 (backward-compatible re-export)
+from cici.jobs import Job, JobStore, PENDING, queue_ahead
+from cici.worker import run_worker
 try:
     from cici import _quota
     from cici import _persist
@@ -39,15 +42,16 @@ log = logging.getLogger("cici.api")
 # Globals
 # --------------------------------------------------------------------------- #
 cfg = _config.load_config()
+_CATALOG = ConfigCatalog(cfg)
 JOB_QUEUE: "asyncio.Queue[Job]" = asyncio.Queue()
 
 
 class _PersistentJobStore(JobStore):
     """JobStore auto-persist: mỗi set() ghi ngay ra disk (best-effort).
 
-    Tách subclass ở server.py thay vì đụng cici/driver.py — giữ driver invariant
-    nguyên (cici/driver không cần biết về persistence). Fail-open: persist lỗi
-    không bao giờ lan tới caller.
+    Tách subclass ở composition root thay vì đụng cici/jobs.py — domain store
+    không cần biết về persistence. Fail-open: persist lỗi không bao giờ lan tới
+    caller.
     """
     def set(self, job_id: str, **fields) -> None:  # type: ignore[override]
         super().set(job_id, **fields)
@@ -81,14 +85,6 @@ if _persist is not None:
             _ENQUEUE_SEQ = seq
 
 
-def queue_ahead(store: JobStore, seq: int) -> int:
-    """Số job PENDING được enqueue TRƯỚC job này (số job đứng trước trong hàng đợi)."""
-    return sum(
-        1 for j in store.data.values()
-        if j.get("status") == "PENDING" and j.get("seq", 0) < seq
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Lifespan: start the single worker consumer on boot
 # --------------------------------------------------------------------------- #
@@ -96,10 +92,9 @@ def queue_ahead(store: JobStore, seq: int) -> int:
 async def lifespan(app: FastAPI):
     global _worker_task
     log.info("Starting Cici consumer worker…")
-    # import here to avoid circular at module load
-    from cici.driver import run_worker
-
-    _worker_task = asyncio.create_task(run_worker(JOB_QUEUE, STORE, cfg))
+    _worker_task = asyncio.create_task(
+        run_worker(JOB_QUEUE, STORE, cfg, driver_factory=CiciDriver)
+    )
     # CDP warm-up probe (non-blocking, best-effort): nếu CDP chưa lên, log cảnh báo
     # sớm để user biết job đầu tiên sẽ pay full connect cost (~30s+ retry backoff).
     # Không fail nếu CDP down — server vẫn serve API, queue vẫn nhận job.
@@ -175,21 +170,14 @@ async def get_quota(kind: str | None = None, account: str | None = None,
 
 
 def _provider_section(section: str, provider: str) -> dict:
-    """models/options cho provider: legacy flat = cici; provider khác nằm ở
-    key trùng tên trong cùng section (models.doubao, options.doubao).
+    """Compatibility facade over the shared provider catalog."""
 
-    View legacy phải loại các key provider (models.doubao...) để client cũ
-    iterate kinds chỉ thấy image/video — không lộ registry provider khác."""
-    data = cfg.get(section, {})
-    prov_names = set(cfg.get("providers", {}) or {})
-    if provider in data:
-        return data[provider]
-    return {k: v for k, v in data.items() if k not in prov_names}
+    return _CATALOG.section(section, provider)
 
 
 def _validate_provider(provider: str) -> None:
-    valid = list(cfg.get("providers", {}).keys()) or ["cici"]
-    if provider not in valid:
+    valid = _CATALOG.providers()
+    if not _CATALOG.has_provider(provider):
         raise HTTPException(
             status_code=422,
             detail=f"Unknown provider '{provider}'. Valid: {valid}",
@@ -207,8 +195,7 @@ async def generate(req: GenerateRequest):
     _validate_provider(req.provider)
     # validate model alias if provided (registry theo provider)
     if req.model:
-        registry = _provider_section("models", req.provider).get(req.type, {})
-        valid = [o["alias"] for o in registry.get("options", [])]
+        valid = _CATALOG.aliases("models", req.type, "options", req.provider)
         if req.model not in valid:
             raise HTTPException(
                 status_code=422,
@@ -216,28 +203,29 @@ async def generate(req: GenerateRequest):
                        f"(provider {req.provider}). Valid: {valid}",
             )
     # validate generation options (ratio/style/duration) against config
-    opts = _provider_section("options", req.provider).get(req.type, {})
-    if req.ratio and req.ratio not in [o["alias"] for o in opts.get("ratios", [])]:
+    ratios = _CATALOG.aliases("options", req.type, "ratios", req.provider)
+    if req.ratio and req.ratio not in ratios:
         raise HTTPException(
             status_code=422,
             detail=f"Unknown ratio '{req.ratio}' for type '{req.type}' "
                    f"(provider {req.provider}). "
-                   f"Valid: {[o['alias'] for o in opts.get('ratios', [])]}",
+                   f"Valid: {ratios}",
         )
     if req.style:
         if req.type != "image":
             raise HTTPException(status_code=422, detail="style chỉ hỗ trợ cho type=image")
-        if req.style not in [o["alias"] for o in opts.get("styles", [])]:
+        styles = _CATALOG.aliases("options", req.type, "styles", req.provider)
+        if req.style not in styles:
             raise HTTPException(
                 status_code=422,
                 detail=f"Unknown style '{req.style}' for type 'image' "
                        f"(provider {req.provider}). "
-                       f"Valid: {[o['alias'] for o in opts.get('styles', [])]}",
+                       f"Valid: {styles}",
             )
     if req.duration:
         if req.type != "video":
             raise HTTPException(status_code=422, detail="duration chỉ hỗ trợ cho type=video")
-        durs = [o["alias"] for o in opts.get("durations", [])]
+        durs = _CATALOG.aliases("options", req.type, "durations", req.provider)
         if not durs:
             raise HTTPException(
                 status_code=422,
@@ -317,7 +305,7 @@ async def generate(req: GenerateRequest):
     _ENQUEUE_SEQ += 1
     STORE.set(
         job.job_id,
-        status="PENDING",
+        status=PENDING,
         seq=_ENQUEUE_SEQ,
         kind=job.kind,
         provider=job.provider,
@@ -334,7 +322,7 @@ async def generate(req: GenerateRequest):
              len(job.references), job.prompt[:60])
     return GenerateResponse(
         job_id=job.job_id,
-        status="PENDING",
+        status=PENDING,
         message=f"Job queued. Poll GET /api/status/{job.job_id} for results.",
         timeout_s=int(cfg["timing"][f"{req.type}_timeout"]),
     )
@@ -370,7 +358,7 @@ async def status(job_id: str):
     st = data.get("status")
     return {
         **data,
-        "queue_ahead": queue_ahead(STORE, data.get("seq", 0)) if st == "PENDING" else 0,
+        "queue_ahead": queue_ahead(STORE, data.get("seq", 0)) if st == PENDING else 0,
         "queue_size": JOB_QUEUE.qsize(),
     }
 

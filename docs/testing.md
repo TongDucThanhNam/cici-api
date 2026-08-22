@@ -7,8 +7,10 @@ from the repository root):
 
 | Suite | What it exercises |
 | --- | --- |
+| `python tests/test_architecture.py` | Framework-free job/catalog contracts, injected single worker, progressive `ast-tree` command construction |
 | `python tests/test_wait_status.py` | Queue-aware client polling, adaptive backoff, terminal-state short-circuit |
 | `python tests/test_result_detection.py` | The exact result-polling/full-size JS against fixture DOMs |
+| `python tests/test_watermark_video.py` | Watermark-free video response parsing, capture skip paths, config key sync |
 | `python tests/test_quota.py` | Quota rolling window, limit classification, `plan_retry`, CLI `--wait-for-quota` loop (mocked HTTP) |
 | `python tests/test_accounts.py` | Account-label quota isolation and CLI `--account` plumbing |
 | `python tests/test_persist.py` | Job persistence: fail-open loads, ephemeral-key stripping, boot reconcile, retention pruning |
@@ -27,27 +29,35 @@ session and brings the selected Cici page to the foreground.
 Run checks from the repository root and stop at the smallest level that provides
 meaningful evidence for the change.
 
-1. For every patch, inspect `git diff --check` and `git diff --stat`.
-2. For Python edits, compile the touched modules. A repository-wide syntax check is:
+1. For architecture or configuration changes, run the checked-in structural
+   checks (requires the `dev` extra):
+
+   ```powershell
+   ast-tree scan
+   ast-grep test --skip-snapshot-tests
+   ```
+
+2. For every patch, inspect `git diff --check` and `git diff --stat`.
+3. For Python edits, compile the touched modules. A repository-wide syntax check is:
 
    ```powershell
    python -m compileall -q main.py cici_driver.py cici tests
    ```
 
-3. For import, schema, or route changes, import the application if dependencies
+4. For import, schema, or route changes, import the application if dependencies
    are installed:
 
    ```powershell
    python -c "import main; print([r.path for r in main.app.routes])"
    ```
 
-4. For pure client, quota, parsing, or validation logic, add focused deterministic
+5. For pure client, quota, parsing, or validation logic, add focused deterministic
    tests before relying on a live browser. Keep network, filesystem, clock, and
    home-directory state injectable or isolated.
-5. For server integration, start Uvicorn on loopback and exercise only the changed
+6. For server integration, start Uvicorn on loopback and exercise only the changed
    non-generation endpoints first. `/api/health` may validly report
    `unreachable` when Cici is not running.
-6. Run live DOM or generation checks only when the task explicitly requires them
+7. Run live DOM or generation checks only when the task explicitly requires them
    and all prerequisites below are met.
 
 Documentation-only changes normally need link/path inspection plus the diff
@@ -58,6 +68,7 @@ checks; they do not justify starting Cici or consuming generation quota.
 | Area changed | Minimum useful evidence |
 | --- | --- |
 | Documentation/config comments | Diff checks; verify referenced files and commands exist |
+| Module ownership/dependency direction | `ast-tree scan`, ast-grep rule tests, syntax, `test_architecture.py` |
 | Pure helper/client/quota logic | Syntax check plus focused deterministic tests |
 | API schema or endpoint | Syntax/import check plus request/response test without generation where possible |
 | CLI behavior | Invoke the changed command through Click with network/browser calls mocked or isolated |

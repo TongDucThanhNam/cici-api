@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+id: no-parallel-browser-operations
+language: Python
+severity: error
+message: Do not parallelize Cici browser operations with asyncio.gather.
+note: The signed-in chat surface is a single-consumer resource; keep UI operations serialized.
+files:
+  - cici/driver.py
+rule:
+  pattern: asyncio.gather($$$ARGS)

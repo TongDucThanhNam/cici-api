@@ -7,7 +7,7 @@
 # bản ~/.cici/config.yaml cũ cần nhận). Server tự nâng cấp bản user khi thấy
 # version cao hơn (backup config.yaml.bak-<ts>), xem cici/_config.py.
 
-config_version: 3
+config_version: 5
 
 # --------------------------------------------------------------------------- #
 # Providers — mỗi app là một "chat surface" riêng (CDP endpoint + registry).
@@ -117,6 +117,15 @@ selectors:
   # Video kết quả: block video trong bot message. Chứa img.cover (thumbnail);
   # <video src> CHỈ được tạo khi click vào block (xgplayer lazy-init) -> driver click rồi đọc src.
   result_video: 'div[class*="block-video"]'
+  # --- Watermark-free video: driver gọi TRỰC TIẾP API sanctioned
+  # POST /creativity/resource/get_without_watermark với vid suy ra từ URL video.
+  # Account không có entitlement → without_watermark:false → giữ URL gốc (best-effort).
+  # Provider được phép chạy (mở rộng khi đã verify live cho provider đó):
+  video_watermark_providers: ["cici"]
+  # Host API theo provider (verify live 2026-08-22 cho cả 2 app):
+  video_watermark_api_hosts:
+    cici: "www.dola.com"
+    doubao: "www.doubao.com"
 
 # --- Refusal / content-block patterns ---
 # Cici ĐÃ gen xong nhưng TỪ CHỐI hiển thị kết quả (bản quyền / content policy),
@@ -125,6 +134,39 @@ selectors:
 # nhanh (CONTENT_BLOCKED) thay vì spin tới timeout. Match case-insensitive
 # substring. Thêm pattern khi thấy Cici đổi wording.
 messages:
+  # Bot hỏi xác nhận trước khi gen (vd prompt dạng parameter sheet → Dola trả
+  # "Reply "confirm" and I'll generate it directly.", hoặc hỏi A/B/C duration
+  # "Or just reply "Generate"...", hoặc "Which duration do you want?" không
+  # kèm lệnh reply) — driver tự reply tối đa auto_confirm_max lần: chữ cái
+  # khớp duration nếu bot hỏi A/B/C, ngược lại token bot chỉ định
+  # ("Generate"/"confirm" — lấy bằng _extract_reply_token), cuối cùng option
+  # đầu (5s default) nếu chỉ có danh sách A/B/C. Vẫn hỏi lại → fail nhanh
+  # thay vì spin tới timeout + block queue. Match case-insensitive substring
+  # trên LAST bot message; danh sách A/B/C detect structural (≥2 option).
+  auto_confirm_max: 2
+  confirm_request_patterns:
+    - 'reply "confirm"'
+    - "reply \u201cconfirm\u201d"
+    - "reply 'confirm'"
+    - "please confirm"
+    - "hãy xác nhận"
+    - "xác nhận để"
+    - "请确认"
+    # Generic: bot chỉ định token bất kỳ để tiếp tục — bắt cả "reply "Generate""
+    # (curly “ ”). Token thật driver tự extract, pattern chỉ dùng để detect.
+    - 'reply "'
+    - "reply \u201c"
+    - "reply '"
+    - 'trả lời "'
+    - "trả lời \u201c"
+  # Video message của Doubao KHÔNG render action bar (done_indicator) — poll
+  # fallback: text thông báo hoàn tất trong bot message (case-insensitive
+  # substring). Verify live 2026-08-22: Doubao ZH "你的视频生成好了",
+  # Cici EN "Your video is ready."
+  video_done_patterns:
+    - "视频生成好"
+    - "video is ready"
+    - "video của bạn đã sẵn sàng"
   refusal_patterns:
     - "bảo vệ bản quyền"
     - "bản quyền"
@@ -160,7 +202,9 @@ models:
         note: "Mặc định. Chất lượng video tốt nhất."
       - alias: seedance-2-fast
         name: "Dreamina Seedance 2.0 Nhanh"
-        select_text: "Dreamina Seedance 2.0 Nhanh"
+        # Đa ngôn ngữ: VI "Nhanh" / EN "Fast" (verify live dropdown EN
+        # 2026-08-22: "Dreamina Seedance 2.0 Fast\nHigh quality for fast results")
+        select_text: ["Dreamina Seedance 2.0 Nhanh", "Dreamina Seedance 2.0 Fast"]
         note: "Nhanh, chất lượng tốt."
       - alias: seedance-1.0
         name: "Dreamina Seedance 1.0"
@@ -314,8 +358,10 @@ timing:
   # Polling interval (s) khi chờ kết quả
   poll_interval: 3
   # Timeout tối đa mỗi job (s). Image ~123s thực tế; video lâu hơn.
+  # Video free-tier có lúc xếp hàng rất lâu (đã quan sát ~50 phút giờ cao điểm)
+  # nên budget mặc định 30 phút — tăng ở đây nếu hay bị TIMEOUT.
   image_timeout: 300
-  video_timeout: 600
+  video_timeout: 1800
   # Hard deadline mỗi job = <kind>_timeout + margin này (s), ép bằng asyncio.wait_for.
   # Margin chừa cho UI steps (chọn model/ratio/style, upload tới 10 refs, typing).
   # Vượt deadline → job FAILED + reload UI, queue đi tiếp (bảo vệ single-consumer).
@@ -339,6 +385,9 @@ timing:
   fullsize_wait: 60
   # Chờ tối đa (s) MỖI ảnh cho viewer lazy-load bản gốc
   fullsize_each_wait: 5
+  # Ngân sách tối đa (s) cho việc capture URL video không watermark (click
+  # download trong canvas panel + chờ response get_without_watermark).
+  video_watermark_wait: 30
   # Delay sau khi Escape đóng image viewer
   viewer_close_delay: 0.6
 

@@ -31,6 +31,7 @@
 - **2 provider**: Cici (Dola — mặc định) và **Doubao (豆包 — bản TQ cùng codebase)**: `--provider doubao`. Registry model + quota riêng, Seedream 5.0 Pro/5.0 Lite có ở Doubao, CDP song song 2 app (9222/9223).
 - **Cho AI agent**: `--json` stdout sạch, exit codes chuẩn hoá (0/1/2/3/4), timeout đồng bộ từ server.
 - **Ảnh gốc full-size** — tự nâng từ preview (~288px/384px) lên bản gốc (vd 1773×2364 Cici, 2848×1600 Doubao) qua viewer/side-panel; mọi provider.
+- **Video không watermark** — driver gọi trực tiếp API sanctioned `get_without_watermark` của ByteDance với vid suy ra từ URL video. Best-effort: account không có entitlement (server trả `without_watermark: false`) thì giữ URL gốc.
 - **Image + Video**: model Seedream/Seedance, ratio, style, duration, ảnh tham chiếu (image-to-video).
 - **Queue an toàn** — single-consumer, N agent gọi đồng thời vẫn xếp hàng đúng, `queue_ahead` minh bạch.
 - **Job persistence** — state ghi xuống `~/.cici/jobs.json`; restart server giữa job thì job in-flight bị đánh FAILED (kèm lỗi rõ ràng) thay vì biến mất, job đã xong vẫn tra cứu được sau restart (retention 7 ngày).
@@ -239,16 +240,18 @@ State ở `~/.cici/quota.json` (hoặc `~/.cici/quota-<nhãn>.json` khi dùng
 |---|---|---|
 | `0` | COMPLETED | gen xong, có URLs |
 | `1` | FAILED | job lỗi server-side (kể cả `CONTENT_BLOCKED` — xem [Giới hạn](#giới-hạn-đã-biết)) |
-| `2` | TIMEOUT | gen không xong trong timeout (300s ảnh / 600s video — theo `config.yaml`, server trả kèm `timeout_s` trong 202) — **chỉ tính thời gian PROCESSING**; chờ hàng đợi (PENDING) tính riêng theo `queue_ahead` |
+| `2` | TIMEOUT | gen không xong trong timeout (300s ảnh / 1800s video — theo `config.yaml`, server trả kèm `timeout_s` trong 202) — **chỉ tính thời gian PROCESSING**; chờ hàng đợi (PENDING) tính riêng theo `queue_ahead`. Video free-tier có lúc xếp hàng rất lâu (đã quan sát ~50 phút giờ cao điểm) — tăng `timing.video_timeout` nếu hay TIMEOUT |
 | `3` | PREFLIGHT | server/Cici chưa chạy, **hoặc mất kết nối server giữa chừng** (`POLL_ERROR` — job có thể vẫn đang chạy, kiểm tra `cici status <job_id>`) |
 | `4` | QUOTA_EXHAUSTED | hết quota hằng ngày — **đừng retry ngay**, chờ reset (rolling 24h). Trừ khi chạy với `--wait-for-quota`: CLI tự chờ + retry trong giới hạn rồi mới exit 4 |
 
 ### Dành cho AI coding agent
 
 - `cici image` **block ~2–4 phút** → set tool timeout cao (≥ 320s).
+- `cici video` **block ~5–30+ phút** (free-tier có lúc xếp hàng rất lâu) → set tool timeout ≥ 2000s hoặc gọi async rồi poll `cici status <job>`.
 - `--json`: kết quả cuối in ra **stdout** (1 JSON duy nhất), progress log ra stderr → đọc pipe stdout là parse được.
 - URL kết quả có `x-expires` (parse sẵn field `expires_local`) — thường xa ~10 năm nên hiếm khi gấp.
 - **Chất lượng ảnh**: driver tự nâng URL từ preview (~288px, watermark lớn) lên **ảnh gốc full-size** (vd 1773×2364) bằng image viewer (template `image_pre_watermark`). Nếu viewer đổi/fail → job vẫn COMPLETED với URL preview (fallback), log ghi `Full-size upgrade: N/M`. Ảnh gốc vẫn còn watermark nhỏ "AI generated" ở góc — do Cici áp lên chính file gốc, không có bản sạch qua UI này.
+- **Chất lượng video**: sau khi video hoàn tất, driver gọi trực tiếp `POST /creativity/resource/get_without_watermark` (API chính chủ của ByteDance, từ context trang chat nên cookie phiên tự đính kèm) với vid suy ra từ URL video, lấy URL **không watermark** nếu account có entitlement. Best-effort như fullsize: entitlement tắt (`without_watermark: false`) / lỗi / provider ngoài `video_watermark_providers` → trả URL gốc, log ghi `Watermark-free upgrade: N/M`.
 - Nhiều agent gọi đồng thời: queue xử lý tuần tự, `PENDING` kéo dài là bình thường (xem `queue_ahead` trong `cici status`).
 
 ---
@@ -369,7 +372,7 @@ selectors:
 
 timing:
   image_timeout: 300        # giây
-  video_timeout: 600
+  video_timeout: 1800       # video free-tier có lúc xếp hàng ~50 phút giờ cao điểm
   hard_deadline_margin: 180 # + timeout = hard deadline mỗi job
 ```
 
@@ -415,6 +418,22 @@ timing:
 - **Doubao: không có `--duration`** — video tab Doubao gộp duration trong nút
   ratio ("自动 · 10s"), không có picker riêng; model Doubao tiêu thụ quota theo
   bộ nhân (4x/3x/2x) nên quota estimate local lạc quan hơn Cici.
+- **Doubao video: hover-to-init + done theo text** — xgplayer của Doubao chỉ
+  lazy-init `<video>` khi hover thật (JS click không được, verify live
+  2026-08-22) và video message **không render action bar**; driver hover block
+  video mỗi poll và nhận done qua `messages.video_done_patterns` (text
+  "你的视频生成好了" / "Your video is ready.") — vẫn yêu cầu có `<video>` src thật.
+- **Watermark-free video cần entitlement** — API `get_without_watermark` trả
+  `without_watermark: false` cho account free (verify live cả Cici lẫn Doubao);
+  driver tự fallback giữ URL gốc. Entitlement xuất hiện (member/experiment/
+  enterprise) thì tính năng tự kích hoạt không cần đổi code.
+- **Bot hỏi "confirm"/"Generate" trước khi gen** — prompt dạng parameter sheet đôi khi khiến
+  Dola hỏi "Reply "confirm"…", hỏi A/B/C duration ("Or just reply "Generate"…") hoặc hỏi
+  thẳng "Which duration do you want?" không kèm lệnh reply — driver tự reply (chữ cái khớp
+  `-d` nếu có, ngược lại token bot chỉ định, cuối cùng option đầu = 5s default) tối đa
+  `messages.auto_confirm_max` (2) lần; hỏi lại quá số lần →
+  FAILED nhanh với lỗi rõ ràng (không spin tới timeout). Pattern nằm ở
+  `messages.confirm_request_patterns`.
 - **Tốc độ** — tuần tự ~2 phút/job ảnh; không phù hợp throughput cao.
 - **Quota** — dùng quota free của account Cici; rate-limit / block có thể xảy ra bất cứ lúc nào.
 - **UI Cici cập nhật** = phải re-inspect config (xem [Xử lý sự cố](#xử-lý-sự-cố)).
@@ -426,12 +445,14 @@ timing:
 ```bash
 pip install -r requirements.txt && pip install -e .
 python -m cici.server                       # chạy server từ repo
+# contributor tools: pip install -e ".[dev]" && ast-tree map cici
 ```
 
 Tests (xuất phát từ repo root, không tốn quota):
 
 ```bash
 python -m compileall -q main.py cici_driver.py cici tests   # syntax
+python tests/test_architecture.py           # module contracts + injected worker
 python tests/test_wait_status.py            # queue-aware client polling
 python tests/test_result_detection.py       # result-polling JS trên fixture DOM
 python tests/test_quota.py                  # quota + --wait-for-quota loop (mock)
@@ -448,7 +469,12 @@ cici-api/
 ├── cici/                      # package (wheel tự chứa: CLI + server + config)
 │   ├── cli.py                 # Click commands: image/video/doctor/health/status/quota/models
 │   ├── server.py              # FastAPI endpoints + queue/store + lifespan (shim: main.py)
-│   ├── driver.py              # Playwright CDP driver + worker loop (shim: cici_driver.py)
+│   ├── jobs.py                # job/status contracts + in-memory store + queue position
+│   ├── worker.py              # single-consumer loop + hard deadlines (driver injected)
+│   ├── driver.py              # Playwright CDP adapter (shim: cici_driver.py)
+│   ├── catalog.py             # provider-aware model/option registry
+│   ├── _interaction.py        # pure refusal/confirmation + auto-reply policy
+│   ├── devtools.py            # `ast-tree` progressive AST navigation wrapper
 │   ├── _config.py             # config resolution (env > cwd > ~/.cici > packaged)
 │   ├── _client.py             # sync HTTP client + wait_status + URL expiry parser
 │   ├── _launcher.py           # auto-launch Cici + spawn server (python -m cici.server)
@@ -456,8 +482,10 @@ cici-api/
 │   ├── _persist.py            # job persistence (~/.cici/jobs.json) + boot reconcile + retention
 │   └── config.yaml            # config mặc định đóng gói (giữ đồng bộ với bản repo-root)
 ├── main.py / cici_driver.py   # shim backward-compat (re-export từ cici/)
+├── sgconfig.yml / ast-grep/   # AST architecture rules + rule tests
 ├── config.yaml                # config nguồn (dev) — giữ đồng bộ với cici/config.yaml
 ├── tests/
+│   ├── test_architecture.py       # domain/catalog/worker/ast-tree contracts
 │   ├── test_result_detection.py   # fixture-DOM tests cho poll JS
 │   ├── test_wait_status.py        # queue-aware wait tests
 │   ├── test_quota.py              # quota + --wait-for-quota tests

@@ -29,6 +29,16 @@ from . import _quota
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# Windows: khi stdout/stderr bị pipe/redirect (vd `cici --help | head`), Python dùng
+# code page legacy (cp1252) thay vì UTF-8 của console → UnicodeEncodeError trên text
+# tiếng Việt. Ép UTF-8 cho mọi luồng output trước khi in bất kỳ thứ gì.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
 console = Console(stderr=True)  # human-facing log -> stderr, stdout giữ JSON/URLs sạch cho agent
 out_console = Console()         # stdout (cho URLs / JSON)
 
